@@ -6,9 +6,9 @@ Needle 是一款原生 macOS 文件搜索工具，目标是在 macOS 上提供�
 
 ## 界面预览
 
-![Needle 主搜索窗口](docs/images/needle-main.png)
+![Needle 主搜索窗口](docs/images/needle-main-real.png)
 
-![Needle 设置覆盖页](docs/images/needle-settings.png)
+![Needle 设置覆盖页](docs/images/needle-settings-real.png)
 
 ![Needle 应用图标](docs/images/needle-icon.png)
 
