@@ -4,6 +4,14 @@ Needle 是一款原生 macOS 文件搜索工具，目标是在 macOS 上提供�
 
 第一版重点是“独立极速文件名索引 + 原生 macOS 交互体验”。Needle 不把 Spotlight 作为主搜索引擎，而是使用本地 SQLite 索引、初始目录扫描和 FSEvents 增量监听来维护搜索数据。
 
+## 界面预览
+
+![Needle 主搜索窗口](docs/images/needle-main.png)
+
+![Needle 设置覆盖页](docs/images/needle-settings.png)
+
+![Needle 应用图标](docs/images/needle-icon.png)
+
 ## 主要特性
 
 - 原生 Swift / SwiftUI macOS 应用，默认中文界面。
@@ -90,4 +98,4 @@ Needle 的目标不是简单复刻 Windows Everything 的界面，而是把“�
 
 ## 许可证
 
-当前尚未选择正式开源许可证。发布前需要补充 `LICENSE`。
+Needle 使用 [GNU Affero General Public License v3.0](LICENSE) 开源。
