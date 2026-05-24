@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+.omx/
+dist/
+Packaging/AppIcon.iconset/
+Packaging/AIIconVariants/
+Packaging/IconVariants/
+tmp/
+*.swp
