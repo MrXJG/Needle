@@ -331,6 +331,7 @@ private extension SearchWindow {
                         copyName: model.copyName,
                         copyParentPath: model.copyParentPath
                     )
+                    .equatable()
                     .frame(minWidth: 520)
 
                         SplitResizeHandle(
@@ -715,7 +716,7 @@ private struct PacmanShape: Shape {
     }
 }
 
-struct ResultsList: View {
+struct ResultsList: View, @preconcurrency Equatable {
     let results: [FileRecord]
     @Binding var selection: FileRecord.ID?
     let open: (FileRecord) -> Void
@@ -727,6 +728,13 @@ struct ResultsList: View {
     let copyName: (FileRecord) -> Void
     let copyParentPath: (FileRecord) -> Void
     @State private var sortOrder = [KeyPathComparator<FileRecord>]()
+
+    static func == (lhs: ResultsList, rhs: ResultsList) -> Bool {
+        lhs.selection == rhs.selection
+            && lhs.results.map(\.id) == rhs.results.map(\.id)
+            && lhs.results.map(\.modifiedAt) == rhs.results.map(\.modifiedAt)
+            && lhs.results.map(\.size) == rhs.results.map(\.size)
+    }
 
     private var displayedResults: [FileRecord] {
         guard let primaryComparator = sortOrder.first else {

@@ -171,7 +171,10 @@ final class SearchCoreTests: XCTestCase {
 
         let databaseURL = directory.appendingPathComponent("index.sqlite")
         let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
-        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults)
+        )
         model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
         model.queryText = "PlayCover_3.1.0"
 
@@ -224,7 +227,11 @@ final class SearchCoreTests: XCTestCase {
 
         let databaseURL = directory.appendingPathComponent("index.sqlite")
         let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
-        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            backgroundUnloadDelay: .zero
+        )
         model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
         model.queryText = "report"
 
@@ -236,9 +243,10 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(model.indexedRecordCount, 1)
 
         model.enterBackground()
+        try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertFalse(model.isMemoryIndexLoaded)
-        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
         XCTAssertEqual(model.indexedRecordCount, 1)
 
         await model.enterForeground()
@@ -277,6 +285,65 @@ final class SearchCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDefaultListDoesNotSelfHealIntoEmptyResultsFromMissingVisibleFiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let firstFileURL = directory.appendingPathComponent("first.txt")
+        let secondFileURL = directory.appendingPathComponent("second.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("first".utf8).write(to: firstFileURL)
+        try Data("second".utf8).write(to: secondFileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertFalse(model.results.isEmpty)
+
+        try FileManager.default.removeItem(at: firstFileURL)
+        try FileManager.default.removeItem(at: secondFileURL)
+        model.matchPath.toggle()
+        model.matchPath.toggle()
+        try await Task.sleep(for: .milliseconds(350))
+
+        XCTAssertFalse(model.results.isEmpty)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testSearchSkipsRedundantRequestsWhenInputsUnchanged() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("needle-performance-note.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "needle-performance-note"
+
+        await model.start()
+        await model.rebuildIndex()
+        try await Task.sleep(for: .milliseconds(350))
+
+        let executedBefore = model.executedSearchCount
+        XCTAssertGreaterThan(executedBefore, 0)
+
+        model.queryText = "needle-performance-note"
+        try await Task.sleep(for: .milliseconds(350))
+
+        XCTAssertEqual(model.executedSearchCount, executedBefore)
+        XCTAssertGreaterThan(model.skippedSearchCount, 0)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
     func testStartPrunesSQLiteRecordsExcludedByCurrentSettings() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let databaseURL = directory.appendingPathComponent("index.sqlite")
@@ -310,7 +377,26 @@ final class SearchCoreTests: XCTestCase {
         let settings = IndexSettings()
 
         XCTAssertEqual(settings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
-        XCTAssertEqual(settings.excludedNamePatterns, [".DS_Store"])
+        XCTAssertEqual(
+            settings.excludedNamePatterns,
+            [
+                ".DS_Store",
+                "Library/Caches",
+                "Library/HTTPStorages",
+                "Safari/Favicon Cache",
+                ".Trash",
+                "node_modules",
+                ".build"
+            ]
+        )
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/Caches/cache.db", name: "cache.db"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/HTTPStorages/site.sqlite", name: "site.sqlite"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/Safari/Favicon Cache/favicon.db", name: "favicon.db"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/Containers/com.app/Data/Library/Caches/cache.db", name: "cache.db"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/.Trash/old.txt", name: "old.txt"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/project/node_modules/pkg/index.js", name: "index.js"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/project/.build/debug/Needle", name: "Needle"))
+        XCTAssertTrue(settings.shouldIndex(path: "/Users/me/Library/Preferences/com.example.app.plist", name: "com.example.app.plist"))
     }
 
     func testAppSettingsDecodeLegacyPayloadKeepsBackgroundDefaultEnabled() throws {
@@ -364,6 +450,28 @@ final class SearchCoreTests: XCTestCase {
             settings.excludedNamePatterns,
             [".git", "node_modules", ".build", "Library/Caches", "DerivedData", ".swiftpm", ".DS_Store"]
         )
+    }
+
+    func testIndexSettingsMigrationUpgradesOldSingleDefaultExclusion() throws {
+        let legacyPayload = """
+        {
+          "roots": ["/Users/me"],
+          "excludedPaths": [],
+          "excludedNamePatterns": [".DS_Store"],
+          "includeHiddenFiles": false,
+          "matchPathByDefault": true
+        }
+        """.data(using: .utf8)!
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        defaults.set(legacyPayload, forKey: "Needle.IndexSettings")
+
+        let preferences = AppPreferences(defaults: defaults)
+        let settings = preferences.load()
+        let persisted = try XCTUnwrap(defaults.data(forKey: "Needle.IndexSettings"))
+        let persistedSettings = try JSONDecoder().decode(IndexSettings.self, from: persisted)
+
+        XCTAssertEqual(settings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
+        XCTAssertEqual(persistedSettings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
     }
 
     func testIndexSettingsMigrationRestoresEmptyExclusionsAndPersistsThem() throws {

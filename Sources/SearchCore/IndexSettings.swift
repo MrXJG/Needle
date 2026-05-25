@@ -1,8 +1,18 @@
 import Foundation
 
 public struct IndexSettings: Codable, Equatable, Sendable {
-    public static let commonExcludedNamePatterns = [
+    public static let legacyCommonExcludedNamePatterns = [
         ".DS_Store"
+    ]
+
+    public static let commonExcludedNamePatterns = [
+        ".DS_Store",
+        "Library/Caches",
+        "Library/HTTPStorages",
+        "Safari/Favicon Cache",
+        ".Trash",
+        "node_modules",
+        ".build"
     ]
 
     public var roots: [String]
@@ -51,7 +61,7 @@ public struct IndexSettings: Codable, Equatable, Sendable {
     }
 
     public mutating func migrateIfNeeded() {
-        if excludedNamePatterns.isEmpty {
+        if excludedNamePatterns.isEmpty || excludedNamePatterns == Self.legacyCommonExcludedNamePatterns {
             excludedNamePatterns = Self.commonExcludedNamePatterns
         }
     }
