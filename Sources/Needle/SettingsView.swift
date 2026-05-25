@@ -440,11 +440,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var indexStatusView: some View {
-        if model.indexNeedsRebuild {
-            Label("设置已更改，需要重建索引", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                .foregroundStyle(.orange)
-        } else {
-            switch model.state {
+        switch model.state {
         case .idle:
             Label("未开始索引", systemImage: "tray")
                 .foregroundStyle(.secondary)
@@ -459,8 +455,13 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         case .watching:
-            Label("\(model.indexedRecordCount.formatted()) 个项目", systemImage: "tray.full")
-                .foregroundStyle(.secondary)
+            if model.indexNeedsRebuild {
+                Label("设置已更改，需要重建索引", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    .foregroundStyle(.orange)
+            } else {
+                Label("\(model.indexedRecordCount.formatted()) 个项目", systemImage: "tray.full")
+                    .foregroundStyle(.secondary)
+            }
         case .permissionBlocked:
             Label("部分位置需要权限", systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
@@ -468,7 +469,6 @@ struct SettingsView: View {
             Label(message, systemImage: "exclamationmark.circle")
                 .foregroundStyle(.red)
                 .lineLimit(1)
-            }
         }
     }
 

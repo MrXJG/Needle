@@ -5,6 +5,7 @@ CONFIGURATION="${1:-debug}"
 INSTALL_MODE="${2:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIGN_IDENTITY="${NEEDLE_SIGN_IDENTITY:--}"
+VERSION_FROM_ENV="${NEEDLE_APP_VERSION:-}"
 
 cd "$ROOT_DIR"
 
@@ -15,6 +16,24 @@ sign_app() {
   else
     codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp "$app_path" >/dev/null
   fi
+}
+
+resolve_app_version() {
+  if [[ -n "$VERSION_FROM_ENV" ]]; then
+    printf '%s' "${VERSION_FROM_ENV#v}"
+    return
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    local latest_tag
+    latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+    if [[ -n "$latest_tag" ]]; then
+      printf '%s' "${latest_tag#v}"
+      return
+    fi
+  fi
+
+  printf '%s' "0.0.0"
 }
 
 swift build -c "$CONFIGURATION" --product Needle
@@ -37,6 +56,11 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$EXECUTABLE" "$MACOS_DIR/Needle"
 cp "$ROOT_DIR/Packaging/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/Packaging/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+
+APP_VERSION="$(resolve_app_version)"
+BUILD_NUMBER="$(date +%Y%m%d%H%M)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
 
 chmod +x "$MACOS_DIR/Needle"
 
