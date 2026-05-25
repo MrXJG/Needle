@@ -4,8 +4,6 @@ Needle 是一款原生 macOS 文件搜索工具，目标是在 macOS 上提供�
 
 第一版重点是“独立极速文件名索引 + 原生 macOS 交互体验”。Needle 不把 Spotlight 作为主搜索引擎，而是使用本地 SQLite 索引、初始目录扫描和 FSEvents 增量监听来维护搜索数据。
 
-当前版本：`v0.2.0`。详细更新内容见 [CHANGELOG.md](CHANGELOG.md)。
-
 ## 界面预览
 
 ![Needle 主搜索窗口](docs/images/needle-main-real.png)
