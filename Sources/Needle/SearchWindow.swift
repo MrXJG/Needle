@@ -43,6 +43,7 @@ struct SearchWindow: View {
             WindowAccessor { window in
                 shortcutController.bind(window: window)
                 window.title = "Needle"
+                window.identifier = NSUserInterfaceItemIdentifier("NeedleSearchWindow")
                 window.isMovableByWindowBackground = true
             }
         }
@@ -66,6 +67,14 @@ struct SearchWindow: View {
             NeedleAppDelegate.settingsHandler = {
                 shortcutController.showSearchWindow()
                 openSettings()
+            }
+            shortcutController.onWindowHidden = {
+                model.enterBackground()
+            }
+            shortcutController.onWindowShown = {
+                Task {
+                    await model.enterForeground()
+                }
             }
             model.refreshPermissionStatus()
             showPermissionGuide = !model.appSettings.hasCompletedOnboarding
@@ -317,7 +326,7 @@ private extension SearchWindow {
                 .help("正在扫描 \(processed.formatted()) 项")
         case .watching:
             CompactStatusBadge(text: "就绪", systemName: "checkmark.circle.fill", tint: .green)
-                .help("已索引 \(model.records.count.formatted()) 项")
+                .help("已索引 \(model.indexedRecordCount.formatted()) 项")
         case .permissionBlocked:
             Button("授予完全磁盘访问权限") {
                 model.openPrivacySettings()
@@ -1239,9 +1248,7 @@ struct PreviewPane: View {
     }
 
     private func shouldAutoloadInlinePreview(for record: FileRecord) -> Bool {
-        guard record.kind == .file else { return false }
-        let previewBudget: Int64 = 25 * 1024 * 1024
-        return record.size <= previewBudget
+        false
     }
 
     private func shouldAutoloadTextPreview(for record: FileRecord) -> Bool {
@@ -1483,6 +1490,16 @@ private final class QuickLookPreviewController: NSObject, @preconcurrency QLPrev
 
     private var previewURL: NSURL?
 
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(releasePreviewResources),
+            name: .needleDidUnloadForegroundResources,
+            object: nil
+        )
+    }
+
     func preview(record: FileRecord) {
         previewURL = URL(fileURLWithPath: record.path) as NSURL
         guard let panel = QLPreviewPanel.shared() else { return }
@@ -1504,5 +1521,12 @@ private final class QuickLookPreviewController: NSObject, @preconcurrency QLPrev
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
         previewURL
+    }
+
+    @objc private func releasePreviewResources() {
+        previewURL = nil
+        guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+        panel.orderOut(nil)
+        panel.reloadData()
     }
 }

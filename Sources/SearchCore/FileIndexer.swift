@@ -40,8 +40,7 @@ public actor FileIndexer {
                     .isDirectoryKey,
                     .isRegularFileKey,
                     .fileSizeKey,
-                    .contentModificationDateKey,
-                    .volumeIdentifierKey
+                    .contentModificationDateKey
                 ],
                 options: [.skipsPackageDescendants],
                 errorHandler: { url, _ in
@@ -101,8 +100,7 @@ public actor FileIndexer {
                 .isDirectoryKey,
                 .isRegularFileKey,
                 .fileSizeKey,
-                .contentModificationDateKey,
-                .volumeIdentifierKey
+                .contentModificationDateKey
             ],
             options: [.skipsPackageDescendants],
             errorHandler: { _, _ in true }
@@ -111,6 +109,10 @@ public actor FileIndexer {
         }
 
         while let childURL = enumerator.nextObject() as? URL {
+            if Task.isCancelled {
+                return records
+            }
+
             guard settings.shouldIndex(path: childURL.path, name: childURL.lastPathComponent) else {
                 enumerator.skipDescendants()
                 continue

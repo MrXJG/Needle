@@ -7,17 +7,22 @@ public enum FileKind: String, Codable, Sendable, CaseIterable {
 }
 
 public struct FileRecord: Identifiable, Equatable, Codable, Sendable {
-    public let id: String
     public let path: String
     public let name: String
-    public let parentPath: String
     public let kind: FileKind
     public let ext: String
     public let size: Int64
     public let modifiedAt: Date
-    public let volumeIdentifier: String
     public var openCount: Int
     public var lastOpenedAt: Date?
+
+    public var id: String { path }
+    public var parentPath: String {
+        guard let slashIndex = path.lastIndex(of: "/"), slashIndex != path.startIndex else {
+            return "/"
+        }
+        return String(path[..<slashIndex])
+    }
 
     public init(
         path: String,
@@ -27,19 +32,16 @@ public struct FileRecord: Identifiable, Equatable, Codable, Sendable {
         ext: String,
         size: Int64,
         modifiedAt: Date,
-        volumeIdentifier: String,
+        volumeIdentifier: String = "",
         openCount: Int = 0,
         lastOpenedAt: Date? = nil
     ) {
-        self.id = path
         self.path = path
         self.name = name
-        self.parentPath = parentPath
         self.kind = kind
         self.ext = ext
         self.size = size
         self.modifiedAt = modifiedAt
-        self.volumeIdentifier = volumeIdentifier
         self.openCount = openCount
         self.lastOpenedAt = lastOpenedAt
     }
@@ -53,8 +55,7 @@ public extension FileRecord {
                 .isDirectoryKey,
                 .isRegularFileKey,
                 .fileSizeKey,
-                .contentModificationDateKey,
-                .volumeIdentifierKey
+                .contentModificationDateKey
             ])
         } catch {
             return nil
@@ -69,13 +70,6 @@ public extension FileRecord {
             kind = .other
         }
 
-        let volumeIdentifier: String
-        if let volume = values.volumeIdentifier {
-            volumeIdentifier = String(describing: volume)
-        } else {
-            volumeIdentifier = "unknown"
-        }
-
         return FileRecord(
             path: url.path,
             name: url.lastPathComponent,
@@ -83,8 +77,7 @@ public extension FileRecord {
             kind: kind,
             ext: url.pathExtension.lowercased(),
             size: Int64(values.fileSize ?? 0),
-            modifiedAt: values.contentModificationDate ?? .distantPast,
-            volumeIdentifier: volumeIdentifier
+            modifiedAt: values.contentModificationDate ?? .distantPast
         )
     }
 }

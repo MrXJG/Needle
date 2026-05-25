@@ -1,12 +1,13 @@
 import AppKit
+import Darwin
 import Foundation
 import Observation
 
 @MainActor
 @Observable
 public final class SearchAppModel {
-    public private(set) var records: [FileRecord] = []
     public private(set) var results: [FileRecord] = []
+    public private(set) var indexedRecordCount = 0
     public private(set) var state: IndexerState = .idle
     public private(set) var lastError: String?
     public private(set) var blockedPaths: [String] = []
@@ -18,7 +19,10 @@ public final class SearchAppModel {
     public private(set) var lastRebuildDurationMS: Double?
     public private(set) var lastRescanDurationMS: Double?
     public private(set) var lastFSEventBatchCount: Int?
+    public private(set) var lastFilteredFSEventBatchCount: Int?
+    public private(set) var lastRescanPathSample: [String] = []
     public private(set) var isSearching = false
+    public private(set) var isMemoryIndexLoaded = false
 
     public var queryText: String = "" {
         didSet { scheduleSearch(showActivity: true) }
@@ -53,21 +57,33 @@ public final class SearchAppModel {
     private let preferences: AppPreferences
     private let watcher: FSEventsWatcher
     private let modelBox: ModelBox
+    private let backgroundEventBuffer: BackgroundEventBuffer
+    private let databaseURL: URL
+    private let databaseDirectoryURL: URL
+    @ObservationIgnored private var recordsStorage: [FileRecord] = []
     private var rescanTask: Task<Void, Never>?
     private var pendingRescanPaths = Set<String>()
+    private var deferredBackgroundEventPaths = Set<String>()
     private var isRescanning = false
+    private var isBackgroundRequested = false
+    private var needsFullRescanOnForeground = false
     private var needsSearchAfterRescan = false
     private var searchTask: Task<Void, Never>?
     private var searchActivityTask: Task<Void, Never>?
+    private var visibilityMonitorTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var workspaceObservers: [NSObjectProtocol] = []
+    private let pendingRescanPathLimit = 512
 
     public init(
         databaseURL: URL = SearchAppModel.defaultDatabaseURL(),
         preferences: AppPreferences = AppPreferences()
     ) {
         let modelBox = ModelBox()
+        let backgroundEventBuffer = BackgroundEventBuffer(pathLimit: 512)
+        self.databaseURL = databaseURL
         self.store = SQLiteStore(databaseURL: databaseURL)
+        self.databaseDirectoryURL = databaseURL.deletingLastPathComponent()
         self.indexer = FileIndexer()
         self.preferences = preferences
         let loadedSettings = preferences.load()
@@ -76,13 +92,18 @@ public final class SearchAppModel {
         self.appSettings = loadedAppSettings
         self.matchPath = loadedSettings.matchPathByDefault
         self.modelBox = modelBox
-        self.watcher = FSEventsWatcher { [weak modelBox] update in
+        self.backgroundEventBuffer = backgroundEventBuffer
+        self.watcher = FSEventsWatcher { [weak modelBox, backgroundEventBuffer] update in
+            if backgroundEventBuffer.enqueueIfBackground(update) {
+                return
+            }
             Task { @MainActor [weak modelBox] in
                 guard let model = modelBox?.model else { return }
                 model.handleFSEvents(update)
             }
         }
         modelBox.model = self
+        startVisibilityMonitorIfNeeded()
     }
 
     public static func defaultDatabaseURL() -> URL {
@@ -100,10 +121,17 @@ public final class SearchAppModel {
         state = .loading
         do {
             try await store.open()
-            records = try await store.loadAll()
+            let loadedRecords = try await store.loadAll()
+            let scopedRecords = filterIndexSettingsRecords(from: loadedRecords)
+            if scopedRecords.count != loadedRecords.count {
+                try await store.replaceAll(with: scopedRecords)
+            }
+            recordsStorage = scopedRecords
+            isMemoryIndexLoaded = true
+            indexedRecordCount = recordsStorage.count
             refreshResults()
             startWatching()
-            if records.isEmpty && !settings.roots.isEmpty {
+            if recordsStorage.isEmpty && !settings.roots.isEmpty {
                 await rebuildIndex()
             } else {
                 indexedSettings = settings
@@ -117,7 +145,9 @@ public final class SearchAppModel {
 
     public func rebuildIndex() async {
         guard !settings.roots.isEmpty else {
-            records = []
+            recordsStorage = []
+            isMemoryIndexLoaded = true
+            indexedRecordCount = 0
             results = []
             stopSearchActivity()
             state = .idle
@@ -138,10 +168,13 @@ public final class SearchAppModel {
                 self?.state = .scanning(processed: processed)
             }
         }
+        let filteredRecords = filterInternalRecords(from: result.records)
 
         do {
-            try await store.replaceAll(with: result.records)
-            records = result.records
+            try await store.replaceAll(with: filteredRecords)
+            recordsStorage = filteredRecords
+            isMemoryIndexLoaded = true
+            indexedRecordCount = filteredRecords.count
             blockedPaths = result.blockedPaths
             indexedSettings = currentSettings
             lastRebuildDurationMS = elapsedMilliseconds(since: startedAt)
@@ -266,14 +299,100 @@ public final class SearchAppModel {
         permissionStatus = PermissionStatusProvider.current()
     }
 
+    public func enterBackground() {
+        backgroundEventBuffer.enterBackground()
+        if isBackgroundRequested, !hasForegroundResources, !hasActiveForegroundWork {
+            return
+        }
+
+        isBackgroundRequested = true
+        guard state != .loading else { return }
+        searchGeneration += 1
+        searchTask?.cancel()
+        searchTask = nil
+        rescanTask?.cancel()
+        rescanTask = nil
+        stopSearchActivity()
+
+        needsSearchAfterRescan = false
+        unloadMemoryIndex()
+    }
+
+    public func enterForeground() async {
+        if let update = backgroundEventBuffer.drainAndEnterForeground() {
+            queueRawBackgroundEvents(update)
+        }
+        isBackgroundRequested = false
+        materializeDeferredBackgroundEvents()
+        guard !isMemoryIndexLoaded else {
+            if needsFullRescanOnForeground {
+                needsFullRescanOnForeground = false
+                await rebuildIndex()
+            } else if !pendingRescanPaths.isEmpty {
+                await runPendingRescan()
+            }
+            return
+        }
+
+        state = .loading
+        do {
+            if needsFullRescanOnForeground {
+                needsFullRescanOnForeground = false
+                isMemoryIndexLoaded = true
+                await rebuildIndex()
+                return
+            }
+
+            recordsStorage = try await store.loadAll()
+            indexedRecordCount = recordsStorage.count
+            isMemoryIndexLoaded = true
+            indexedSettings = settings
+            startWatching()
+            if !pendingRescanPaths.isEmpty {
+                await runPendingRescan()
+            } else {
+                await refreshResultsImmediately()
+                state = settings.roots.isEmpty ? .idle : .watching
+            }
+        } catch {
+            lastError = error.localizedDescription
+            state = .degraded(error.localizedDescription)
+        }
+    }
+
     private func refreshResults(showActivity: Bool = false) {
         scheduleSearch(delay: .milliseconds(0), showActivity: showActivity)
+    }
+
+    private func startVisibilityMonitorIfNeeded() {
+        guard visibilityMonitorTask == nil else { return }
+        visibilityMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                await MainActor.run {
+                    guard let self else { return }
+                    let hasVisibleWindow = NSApplication.shared.activationPolicy() == .regular
+                        && NSApplication.shared.windows.contains { window in
+                        window.identifier?.rawValue == "NeedleSearchWindow"
+                            && window.isVisible
+                            && !window.isMiniaturized
+                            && window.occlusionState.contains(.visible)
+                    }
+                    if hasVisibleWindow {
+                        Task { await self.enterForeground() }
+                    } else {
+                        self.enterBackground()
+                    }
+                }
+            }
+        }
     }
 
     private func refreshResultsImmediately() async {
         searchGeneration += 1
         let generation = searchGeneration
-        let records = records
+        guard isMemoryIndexLoaded else { return }
+        let records = recordsStorage
         let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
         let searchEngine = searchEngine
         let preferredFolderPaths = settings.roots
@@ -300,7 +419,8 @@ public final class SearchAppModel {
     private func scheduleSearch(delay: Duration, showActivity: Bool) {
         searchGeneration += 1
         let generation = searchGeneration
-        let records = records
+        guard isMemoryIndexLoaded else { return }
+        let records = recordsStorage
         let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
         let searchEngine = searchEngine
         let preferredFolderPaths = settings.roots
@@ -347,7 +467,7 @@ public final class SearchAppModel {
     private func beginSearchActivityIfSlow(generation: Int) {
         searchActivityTask?.cancel()
         isSearching = false
-        guard !records.isEmpty else { return }
+        guard !recordsStorage.isEmpty else { return }
 
         searchActivityTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(180))
@@ -366,7 +486,7 @@ public final class SearchAppModel {
     }
 
     private func noteRecordOpened(path: String, at date: Date = Date()) {
-        updateOpenStats(path: path, at: date, in: &records)
+        updateOpenStats(path: path, at: date, in: &recordsStorage)
         updateOpenStats(path: path, at: date, in: &results)
         refreshResults()
     }
@@ -392,13 +512,17 @@ public final class SearchAppModel {
         var lines: [String] = []
         lines.append("Needle Diagnostics")
         lines.append("Generated: \(formatter.string(from: Date()))")
-        lines.append("Records: \(records.count)")
+        lines.append("Records: \(indexedRecordCount)")
+        lines.append("Memory index loaded: \(isMemoryIndexLoaded)")
+        lines.append("Visible results: \(results.count)")
         lines.append("State: \(stateDescription)")
         lines.append("Index needs rebuild: \(indexNeedsRebuild)")
         lines.append("Last search duration ms: \(formattedMetric(lastSearchDurationMS))")
         lines.append("Last rebuild duration ms: \(formattedMetric(lastRebuildDurationMS))")
         lines.append("Last rescan duration ms: \(formattedMetric(lastRescanDurationMS))")
         lines.append("Last FSEvents batch count: \(lastFSEventBatchCount.map(String.init) ?? "-")")
+        lines.append("Last filtered FSEvents batch count: \(lastFilteredFSEventBatchCount.map(String.init) ?? "-")")
+        lines.append("Last rescan path sample: \(lastRescanPathSample.joined(separator: ", "))")
         lines.append("Search query: \(queryText)")
         lines.append("Kind filter: \(kindFilter.rawValue)")
         lines.append("Match path: \(matchPath)")
@@ -486,7 +610,7 @@ public final class SearchAppModel {
     private func handleVolumeAvailabilityChanged() {
         refreshMissingIndexedRoots()
         if missingIndexedRoots.isEmpty {
-            if records.isEmpty, !settings.roots.isEmpty {
+            if recordsStorage.isEmpty, !settings.roots.isEmpty {
                 Task { await rebuildIndex() }
             } else {
                 startWatching()
@@ -503,7 +627,15 @@ public final class SearchAppModel {
     }
 
     private func handleFSEvents(_ update: FSEventsUpdate) {
+        if isBackgroundRequested || !isMemoryIndexLoaded {
+            queueRawBackgroundEvents(update)
+            return
+        }
+
         lastFSEventBatchCount = update.paths.count
+        let filteredPaths = filterInternalPaths(update.paths)
+        lastFilteredFSEventBatchCount = filteredPaths.count
+        guard !filteredPaths.isEmpty || update.requiresFullRescan else { return }
         if update.requiresFullRescan {
             lastError = update.reason
             Task { await rebuildIndex() }
@@ -511,13 +643,82 @@ public final class SearchAppModel {
             lastError = reason
             state = .degraded(reason)
         } else {
-            scheduleRescan(paths: update.paths)
+            scheduleRescan(paths: filteredPaths)
         }
     }
 
+    private func queueRawBackgroundEvents(_ update: FSEventsUpdate) {
+        lastFSEventBatchCount = update.paths.count
+        lastFilteredFSEventBatchCount = nil
+        lastRescanPathSample = Array(update.paths.prefix(8))
+        if update.requiresFullRescan {
+            needsFullRescanOnForeground = true
+            lastError = update.reason
+            deferredBackgroundEventPaths.removeAll()
+            return
+        }
+
+        let availableCapacity = max(0, pendingRescanPathLimit - deferredBackgroundEventPaths.count)
+        guard update.paths.count <= availableCapacity else {
+            needsFullRescanOnForeground = true
+            deferredBackgroundEventPaths.removeAll()
+            return
+        }
+
+        deferredBackgroundEventPaths.formUnion(update.paths)
+    }
+
+    private func materializeDeferredBackgroundEvents() {
+        guard !deferredBackgroundEventPaths.isEmpty else { return }
+        let paths = Array(deferredBackgroundEventPaths)
+        deferredBackgroundEventPaths.removeAll()
+        queueBackgroundRescan(paths: paths)
+    }
+
+    private func queueBackgroundRescan(paths: [String]) {
+        let compactedPaths = Self.preparedRescanPaths(
+            paths,
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        )
+        lastFilteredFSEventBatchCount = compactedPaths.count
+        lastRescanPathSample = Array(compactedPaths.prefix(8))
+        guard !compactedPaths.isEmpty else { return }
+
+        let mergedPendingPaths = Array(pendingRescanPaths) + compactedPaths
+        pendingRescanPaths = Set(Self.preparedRescanPaths(
+            mergedPendingPaths,
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        ))
+    }
+
     private func scheduleRescan(paths: [String]) {
-        lastFSEventBatchCount = paths.count
-        pendingRescanPaths.formUnion(paths)
+        let compactedPaths = Self.preparedRescanPaths(
+            paths,
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        )
+        lastFilteredFSEventBatchCount = compactedPaths.count
+        lastRescanPathSample = Array(compactedPaths.prefix(8))
+        #if DEBUG
+        writeLastRescanSnapshot(paths: compactedPaths)
+        #endif
+        guard !compactedPaths.isEmpty else { return }
+        let mergedPendingPaths = Array(pendingRescanPaths) + compactedPaths
+        pendingRescanPaths = Set(Self.preparedRescanPaths(
+            mergedPendingPaths,
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        ))
+        schedulePendingRescanTask()
+    }
+
+    private func schedulePendingRescanTask() {
         rescanTask?.cancel()
         rescanTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
@@ -526,17 +727,29 @@ public final class SearchAppModel {
     }
 
     private func runPendingRescan() async {
+        guard !Task.isCancelled else { return }
         guard !isRescanning else { return }
         guard !pendingRescanPaths.isEmpty else { return }
 
-        let paths = Array(pendingRescanPaths)
+        let paths = Self.preparedRescanPaths(
+            Array(pendingRescanPaths),
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        )
         pendingRescanPaths.removeAll()
+        guard !paths.isEmpty else { return }
+
         isRescanning = true
         await rescan(paths: paths)
         isRescanning = false
+        if isBackgroundRequested {
+            unloadMemoryIndex()
+            return
+        }
 
         if !pendingRescanPaths.isEmpty {
-            scheduleRescan(paths: [])
+            schedulePendingRescanTask()
         } else if needsSearchAfterRescan {
             needsSearchAfterRescan = false
             refreshResults(showActivity: false)
@@ -545,7 +758,19 @@ public final class SearchAppModel {
 
     private func rescan(paths: [String]) async {
         let startedAt = CFAbsoluteTimeGetCurrent()
-        let uniquePaths = Array(Set(paths))
+        let uniquePaths = Self.preparedRescanPaths(
+            paths,
+            settings: settings,
+            internalExcludedRoots: internalExcludedRoots,
+            maxPaths: pendingRescanPathLimit
+        )
+        guard !uniquePaths.isEmpty else { return }
+        guard !Task.isCancelled, !isBackgroundRequested else {
+            pendingRescanPaths.formUnion(uniquePaths)
+            unloadMemoryIndex()
+            return
+        }
+
         let currentSettings = settings
         let indexer = indexer
         let scannedRecords = await withTaskGroup(of: [FileRecord].self) { group in
@@ -560,14 +785,40 @@ public final class SearchAppModel {
             }
             return collected
         }
-        let newRecords = Self.deduplicatedRecords(scannedRecords)
+        guard !Task.isCancelled, !isBackgroundRequested else {
+            pendingRescanPaths.formUnion(uniquePaths)
+            unloadMemoryIndex()
+            return
+        }
+        let newRecords = Self.deduplicatedRecords(filterInternalRecords(from: scannedRecords))
 
         do {
             try await store.replaceSubtrees(paths: uniquePaths, with: newRecords)
-            let currentRecords = records
-            records = await Task.detached(priority: .utility) {
-                Self.mergedRecords(currentRecords, newRecords: newRecords, replacing: uniquePaths)
-            }.value
+            guard isMemoryIndexLoaded, !isBackgroundRequested else {
+                lastRescanDurationMS = elapsedMilliseconds(since: startedAt)
+                unloadMemoryIndex()
+                state = .watching
+                return
+            }
+            let currentRecords = recordsStorage
+            let mergeJob = Task.detached(priority: .utility) {
+                Self.recordsByApplyingRescan(currentRecords, newRecords: newRecords, replacing: uniquePaths)
+            }
+            let mergedRecords = await withTaskCancellationHandler {
+                await mergeJob.value
+            } onCancel: {
+                mergeJob.cancel()
+            }
+
+            guard !Task.isCancelled, !isBackgroundRequested else {
+                pendingRescanPaths.formUnion(uniquePaths)
+                unloadMemoryIndex()
+                state = .watching
+                return
+            }
+
+            recordsStorage = mergedRecords
+            indexedRecordCount = mergedRecords.count
             lastRescanDurationMS = elapsedMilliseconds(since: startedAt)
             refreshResults(showActivity: false)
             state = .watching
@@ -577,7 +828,94 @@ public final class SearchAppModel {
         }
     }
 
-    nonisolated private static func mergedRecords(
+    private func unloadMemoryIndex() {
+        let hadLoadedResources = hasForegroundResources
+        recordsStorage = []
+        results = []
+        isMemoryIndexLoaded = false
+        if hadLoadedResources {
+            malloc_zone_pressure_relief(nil, 0)
+            NotificationCenter.default.post(name: .needleDidUnloadForegroundResources, object: nil)
+        }
+    }
+
+    private var hasForegroundResources: Bool {
+        isMemoryIndexLoaded || !recordsStorage.isEmpty || !results.isEmpty
+    }
+
+    private var hasActiveForegroundWork: Bool {
+        searchTask != nil || searchActivityTask != nil || rescanTask != nil || isRescanning
+    }
+
+    nonisolated private static func recordsByApplyingRescan(
+        _ records: [FileRecord],
+        newRecords: [FileRecord],
+        replacing paths: [String]
+    ) -> [FileRecord] {
+        let replacementModes = replacementModes(for: paths, existingRecords: records, newRecords: newRecords)
+        guard !Task.isCancelled else { return records }
+        guard replacementModes.subtreeRoots.isEmpty else {
+            return mergedRecords(records, newRecords: newRecords, replacing: paths)
+        }
+
+        return recordsByApplyingExactRescan(
+            records,
+            newRecords: newRecords,
+            exactPaths: replacementModes.exactPaths
+        )
+    }
+
+    nonisolated private static func recordsByApplyingExactRescan(
+        _ records: [FileRecord],
+        newRecords: [FileRecord],
+        exactPaths: Set<String>
+    ) -> [FileRecord] {
+        guard !exactPaths.isEmpty else { return records }
+
+        let newRecordsByPath = Dictionary(uniqueKeysWithValues: newRecords.map { ($0.path, $0) })
+        let indexByExactPath = indexByPath(for: exactPaths, in: records)
+        var changedRecords = records
+        var removedIndices: [Int] = []
+
+        for path in exactPaths {
+            if Task.isCancelled { return records }
+
+            if var newRecord = newRecordsByPath[path] {
+                if let index = indexByExactPath[path] {
+                    newRecord.openCount = records[index].openCount
+                    newRecord.lastOpenedAt = records[index].lastOpenedAt
+                    changedRecords[index] = newRecord
+                } else {
+                    changedRecords.append(newRecord)
+                }
+            } else if let index = indexByExactPath[path] {
+                removedIndices.append(index)
+            }
+        }
+
+        for index in removedIndices.sorted(by: >) {
+            changedRecords.remove(at: index)
+        }
+
+        return changedRecords
+    }
+
+    nonisolated private static func indexByPath(for paths: Set<String>, in records: [FileRecord]) -> [String: Int] {
+        guard !paths.isEmpty else { return [:] }
+        var indexByPath: [String: Int] = [:]
+        indexByPath.reserveCapacity(paths.count)
+        for (index, record) in records.enumerated() where paths.contains(record.path) {
+            if Task.isCancelled { return [:] }
+
+            indexByPath[record.path] = index
+            if indexByPath.count == paths.count {
+                break
+            }
+        }
+        return indexByPath
+    }
+
+    nonisolated static func mergedRecords(
         _ records: [FileRecord],
         newRecords: [FileRecord],
         replacing paths: [String]
@@ -586,6 +924,8 @@ public final class SearchAppModel {
         openStatsByPath.reserveCapacity(records.count)
 
         for record in records {
+            if Task.isCancelled { return records }
+
             let existing = openStatsByPath[record.path]
             openStatsByPath[record.path] = (
                 openCount: max(existing?.openCount ?? 0, record.openCount),
@@ -593,13 +933,18 @@ public final class SearchAppModel {
             )
         }
 
-        let replacementRoots = Set(paths)
-        let replacementPrefixes = paths.map { $0 + "/" }
+        let replacementModes = replacementModes(for: paths, existingRecords: records, newRecords: newRecords)
+        guard !Task.isCancelled else { return records }
         var mergedRecords: [FileRecord] = []
         mergedRecords.reserveCapacity(max(records.count, records.count - paths.count + newRecords.count))
 
         for record in records {
-            guard !shouldReplace(record.path, roots: replacementRoots, prefixes: replacementPrefixes) else {
+            if Task.isCancelled { return records }
+
+            guard !replacementModes.exactPaths.contains(record.path) else {
+                continue
+            }
+            guard !shouldReplace(record.path, roots: replacementModes.subtreeRoots) else {
                 continue
             }
             mergedRecords.append(record)
@@ -618,12 +963,65 @@ public final class SearchAppModel {
         return mergedRecords
     }
 
-    nonisolated private static func shouldReplace(
+    nonisolated private static func replacementModes(
+        for paths: [String],
+        existingRecords: [FileRecord],
+        newRecords: [FileRecord]
+    ) -> (exactPaths: Set<String>, subtreeRoots: Set<String>) {
+        let replacementPaths = Set(paths)
+        guard !replacementPaths.isEmpty else { return ([], []) }
+
+        var knownFolderPaths = Set(newRecords.lazy.filter { $0.kind == .folder }.map(\.path))
+        let knownNewRecordPaths = Set(newRecords.lazy.map(\.path))
+        let unresolvedPaths = replacementPaths.subtracting(knownNewRecordPaths)
+
+        if !unresolvedPaths.isEmpty {
+            var foundUnresolvedPaths = Set<String>()
+            for record in existingRecords where unresolvedPaths.contains(record.path) {
+                foundUnresolvedPaths.insert(record.path)
+                if record.kind == .folder {
+                    knownFolderPaths.insert(record.path)
+                }
+                if foundUnresolvedPaths.count == unresolvedPaths.count {
+                    break
+                }
+            }
+        }
+
+        var exactPaths = Set<String>()
+        var subtreeRoots = Set<String>()
+        for path in replacementPaths {
+            if knownFolderPaths.contains(path) {
+                subtreeRoots.insert(path)
+            } else {
+                exactPaths.insert(path)
+            }
+        }
+
+        return (exactPaths, subtreeRoots)
+    }
+
+    nonisolated static func shouldReplace(
         _ path: String,
-        roots: Set<String>,
-        prefixes: [String]
+        roots: Set<String>
     ) -> Bool {
-        roots.contains(path) || prefixes.contains { path.hasPrefix($0) }
+        guard !roots.isEmpty else { return false }
+        if roots.contains(path) {
+            return true
+        }
+
+        var candidate = path
+        while let slashIndex = candidate.lastIndex(of: "/") {
+            candidate = String(candidate[..<slashIndex])
+            if candidate.isEmpty {
+                return false
+            }
+            if roots.contains(candidate) {
+                return true
+            }
+        }
+
+        return false
     }
 
     nonisolated private static func deduplicatedRecords(_ records: [FileRecord]) -> [FileRecord] {
@@ -635,6 +1033,79 @@ public final class SearchAppModel {
         }
 
         return Array(recordsByPath.values)
+    }
+
+    nonisolated static func preparedRescanPaths(
+        _ paths: [String],
+        settings: IndexSettings,
+        internalExcludedRoots: Set<String>,
+        maxPaths: Int
+    ) -> [String] {
+        let indexedRoots = Set(settings.roots.map(normalizedPath))
+        let indexablePaths = paths.compactMap { path -> String? in
+            let normalized = normalizedPath(path)
+            guard !normalized.isEmpty else { return nil }
+            guard !indexedRoots.contains(normalized) else { return nil }
+            guard !shouldReplace(normalized, roots: internalExcludedRoots) else { return nil }
+            guard settings.shouldIndex(path: normalized, name: URL(fileURLWithPath: normalized).lastPathComponent) else {
+                return nil
+            }
+            return normalized
+        }
+
+        return compactedRescanPaths(indexablePaths, indexedRoots: settings.roots, maxPaths: maxPaths)
+    }
+
+    nonisolated static func compactedRescanPaths(
+        _ paths: [String],
+        indexedRoots: [String],
+        maxPaths: Int
+    ) -> [String] {
+        let normalizedPaths = paths
+            .map(normalizedPath)
+            .filter { !$0.isEmpty }
+        guard !normalizedPaths.isEmpty else { return [] }
+
+        let sortedPaths = Array(Set(normalizedPaths)).sorted()
+        var compacted: [String] = []
+        compacted.reserveCapacity(sortedPaths.count)
+
+        for path in sortedPaths {
+            if compacted.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
+                continue
+            }
+            compacted.append(path)
+        }
+
+        guard compacted.count > maxPaths, maxPaths > 0 else {
+            return compacted
+        }
+
+        let roots = indexedRoots.map(normalizedPath).filter { !$0.isEmpty }
+        let promotedParents = compacted.map { promotedRescanParent(for: $0, indexedRoots: roots) }
+        let parentCompacted = Array(Set(promotedParents)).sorted()
+        if parentCompacted.count <= maxPaths {
+            return parentCompacted
+        }
+
+        return roots.isEmpty ? Array(parentCompacted.prefix(maxPaths)) : roots
+    }
+
+    nonisolated private static func promotedRescanParent(for path: String, indexedRoots: [String]) -> String {
+        for root in indexedRoots where path == root || path.hasPrefix(root + "/") {
+            let relativePath = String(path.dropFirst(root.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: true)
+            guard let firstComponent = components.first else { return root }
+            return root + "/" + firstComponent
+        }
+
+        return URL(fileURLWithPath: path).deletingLastPathComponent().path
+    }
+
+    nonisolated private static func normalizedPath(_ path: String) -> String {
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        guard normalized.count > 1, normalized.hasSuffix("/") else { return normalized }
+        return String(normalized.dropLast())
     }
 
     nonisolated private static func latestDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
@@ -652,6 +1123,53 @@ public final class SearchAppModel {
         (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
     }
 
+    private func filterInternalPaths(_ paths: [String]) -> [String] {
+        let excludedRoots = internalExcludedRoots
+        return paths.filter { path in
+            let normalized = Self.normalizedPath(path)
+            return !Self.shouldReplace(normalized, roots: excludedRoots)
+        }
+    }
+
+    private func filterInternalRecords(from records: [FileRecord]) -> [FileRecord] {
+        let excludedRoots = internalExcludedRoots
+        return records.filter { record in
+            !Self.shouldReplace(Self.normalizedPath(record.path), roots: excludedRoots)
+        }
+    }
+
+    private func filterIndexSettingsRecords(from records: [FileRecord]) -> [FileRecord] {
+        records.filter { record in
+            settings.shouldIndex(path: record.path, name: record.name)
+        }
+    }
+
+    private func writeLastRescanSnapshot(paths: [String]) {
+        let directory = diagnosticsDirectoryURL
+        let url = directory.appendingPathComponent("LastRescan.txt")
+        let payload = ([
+            "Generated: \(ISO8601DateFormatter().string(from: Date()))",
+            "Raw FSEvents count: \(lastFSEventBatchCount.map(String.init) ?? "-")",
+            "Filtered FSEvents count: \(lastFilteredFSEventBatchCount.map(String.init) ?? "-")"
+        ] + paths.prefix(40).map { "Path: \($0)" }).joined(separator: "\n")
+
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? payload.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private var internalExcludedRoots: Set<String> {
+        var roots: Set<String> = [
+            Self.normalizedPath(databaseURL.path),
+            Self.normalizedPath(databaseURL.path + "-wal"),
+            Self.normalizedPath(databaseURL.path + "-shm"),
+            Self.normalizedPath(diagnosticsDirectoryURL.path)
+        ]
+        if databaseDirectoryURL.lastPathComponent == "Needle" {
+            roots.insert(Self.normalizedPath(databaseDirectoryURL.path))
+        }
+        return roots
+    }
+
     private func formattedMetric(_ value: Double?) -> String {
         guard let value else { return "-" }
         return String(format: "%.2f", value)
@@ -660,4 +1178,69 @@ public final class SearchAppModel {
 
 private final class ModelBox: @unchecked Sendable {
     @MainActor weak var model: SearchAppModel?
+}
+
+final class BackgroundEventBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let pathLimit: Int
+    private var isBackground = false
+    private var paths = Set<String>()
+    private var requiresFullRescan = false
+    private var reason: String?
+
+    init(pathLimit: Int) {
+        self.pathLimit = pathLimit
+    }
+
+    func enterBackground() {
+        lock.withLock {
+            isBackground = true
+        }
+    }
+
+    func enqueueIfBackground(_ update: FSEventsUpdate) -> Bool {
+        lock.withLock {
+            guard isBackground else { return false }
+
+            if update.requiresFullRescan {
+                requiresFullRescan = true
+                reason = update.reason
+                paths.removeAll()
+                return true
+            }
+
+            guard !requiresFullRescan else { return true }
+            guard paths.count + update.paths.count <= pathLimit else {
+                requiresFullRescan = true
+                reason = "后台文件系统事件过多"
+                paths.removeAll()
+                return true
+            }
+
+            paths.formUnion(update.paths)
+            return true
+        }
+    }
+
+    func drainAndEnterForeground() -> FSEventsUpdate? {
+        lock.withLock {
+            isBackground = false
+            defer {
+                paths.removeAll()
+                requiresFullRescan = false
+                reason = nil
+            }
+
+            if requiresFullRescan {
+                return FSEventsUpdate(paths: [], requiresFullRescan: true, reason: reason)
+            }
+
+            guard !paths.isEmpty else { return nil }
+            return FSEventsUpdate(paths: Array(paths), requiresFullRescan: false, reason: nil)
+        }
+    }
+}
+
+public extension Notification.Name {
+    static let needleDidUnloadForegroundResources = Notification.Name("NeedleDidUnloadForegroundResources")
 }

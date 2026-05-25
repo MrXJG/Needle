@@ -7,10 +7,13 @@ final class GlobalShortcutController {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private weak var window: NSWindow?
-    private lazy var windowDelegate = SearchWindowDelegate {
+    private lazy var windowDelegate = SearchWindowDelegate { [weak self] in
+        self?.onWindowHidden?()
         Self.hideDockIcon()
     }
     private(set) var lastRegistrationStatus: OSStatus = noErr
+    var onWindowHidden: (() -> Void)?
+    var onWindowShown: (() -> Void)?
 
     func bind(window: NSWindow) {
         self.window = window
@@ -79,6 +82,7 @@ final class GlobalShortcutController {
     }
 
     func showSearchWindow() {
+        onWindowShown?()
         Self.showDockIcon()
         NSApp.activate(ignoringOtherApps: true)
         if let window {

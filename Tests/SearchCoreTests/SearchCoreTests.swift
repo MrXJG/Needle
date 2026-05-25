@@ -106,6 +106,17 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(results.map(\.openCount), [79, 78, 77, 76, 75])
     }
 
+    func testEmptySearchReturnsInitialWindowWithoutRankingWholeIndex() {
+        let engine = SearchEngine()
+        let records = (0..<20).map { index in
+            makeRecord(path: "/Users/me/file-\(index).txt", name: "file-\(index).txt", openCount: 20 - index)
+        }
+
+        let results = engine.search(records, query: .parse(""), limit: 5)
+
+        XCTAssertEqual(results.map(\.path), Array(records.prefix(5)).map(\.path))
+    }
+
     func testFiltersByKindAndExtension() {
         let engine = SearchEngine()
         let records = [
@@ -179,6 +190,89 @@ final class SearchCoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    @MainActor
+    func testRebuildExcludesNeedleInternalDatabaseDirectory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let appSupport = directory.appendingPathComponent("AppSupport", isDirectory: true)
+        let databaseURL = appSupport.appendingPathComponent("Needle/index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let rootFile = directory.appendingPathComponent("visible.txt")
+        let internalFile = appSupport.appendingPathComponent("Needle/index.sqlite-wal")
+
+        try FileManager.default.createDirectory(at: internalFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("visible".utf8).write(to: rootFile)
+        try Data("internal".utf8).write(to: internalFile)
+
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertFalse(model.results.contains { $0.path.contains("/Needle/index.sqlite") })
+        XCTAssertTrue(model.results.contains { URL(fileURLWithPath: $0.path).standardizedFileURL.path == rootFile.standardizedFileURL.path })
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testBackgroundUnloadsMemoryIndexAndForegroundReloadsFromSQLite() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("report.md")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "report"
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+        XCTAssertEqual(model.indexedRecordCount, 1)
+
+        model.enterBackground()
+
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertEqual(model.indexedRecordCount, 1)
+
+        await model.enterForeground()
+
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testStartPrunesSQLiteRecordsExcludedByCurrentSettings() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let store = SQLiteStore(databaseURL: databaseURL)
+        try await store.open()
+        try await store.upsert([
+            makeRecord(path: "/Users/me/project/App.swift", name: "App.swift", ext: "swift"),
+            makeRecord(path: "/Users/me/project/node_modules/pkg/index.js", name: "index.js", ext: "js")
+        ])
+
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: ["/Users/me"], excludedNamePatterns: ["node_modules"], includeHiddenFiles: false)
+
+        await model.start()
+
+        XCTAssertEqual(model.indexedRecordCount, 1)
+        let persistedPaths = try await store.loadAll().map(\.path)
+        XCTAssertEqual(persistedPaths, ["/Users/me/project/App.swift"])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
     func testSettingsDefaultToNoRootsForSafeFirstLaunch() {
         let settings = IndexSettings()
 
@@ -191,6 +285,9 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(settings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
         XCTAssertTrue(settings.excludedNamePatterns.contains("node_modules"))
         XCTAssertTrue(settings.excludedNamePatterns.contains("DerivedData"))
+        XCTAssertTrue(settings.excludedNamePatterns.contains("Library/Logs"))
+        XCTAssertTrue(settings.excludedNamePatterns.contains(".codex"))
+        XCTAssertTrue(settings.excludedNamePatterns.contains(".omx"))
     }
 
     func testAppSettingsDecodeLegacyPayloadKeepsBackgroundDefaultEnabled() throws {
@@ -209,12 +306,62 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertTrue(settings.keepRunningAfterWindowClose)
     }
 
+    func testIndexSettingsMigrationAddsNewCommonExclusions() throws {
+        let legacyPayload = """
+        {
+          "roots": ["/Users/me"],
+          "excludedPaths": [],
+          "excludedNamePatterns": [".git", "node_modules", ".build", "Library/Caches", "DerivedData", ".swiftpm", ".DS_Store"],
+          "includeHiddenFiles": false,
+          "matchPathByDefault": true
+        }
+        """.data(using: .utf8)!
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        defaults.set(legacyPayload, forKey: "Needle.IndexSettings")
+
+        let settings = AppPreferences(defaults: defaults).load()
+
+        XCTAssertTrue(settings.excludedNamePatterns.contains(".omx"))
+        XCTAssertTrue(settings.excludedNamePatterns.contains(".codex"))
+        XCTAssertTrue(settings.excludedNamePatterns.contains("Library/Logs"))
+    }
+
+    func testIndexSettingsMigrationRestoresEmptyExclusionsAndPersistsThem() throws {
+        let legacyPayload = """
+        {
+          "roots": ["/Users/me"],
+          "excludedPaths": [],
+          "excludedNamePatterns": [],
+          "includeHiddenFiles": false,
+          "matchPathByDefault": true
+        }
+        """.data(using: .utf8)!
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        defaults.set(legacyPayload, forKey: "Needle.IndexSettings")
+
+        let preferences = AppPreferences(defaults: defaults)
+        let settings = preferences.load()
+        let persisted = try XCTUnwrap(defaults.data(forKey: "Needle.IndexSettings"))
+        let persistedSettings = try JSONDecoder().decode(IndexSettings.self, from: persisted)
+
+        XCTAssertEqual(settings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
+        XCTAssertEqual(persistedSettings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
+    }
+
     func testSettingsExcludeHiddenAndConfiguredNames() {
         let settings = IndexSettings(excludedNamePatterns: [".git", "node_modules"])
 
         XCTAssertFalse(settings.shouldIndex(path: "/tmp/.env", name: ".env"))
         XCTAssertFalse(settings.shouldIndex(path: "/tmp/project/node_modules/pkg", name: "pkg"))
         XCTAssertTrue(settings.shouldIndex(path: "/tmp/project/Sources/App.swift", name: "App.swift"))
+    }
+
+    func testSettingsExcludeOmxStateDirectories() {
+        let settings = IndexSettings()
+
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Desktop/.omx/logs/turns.jsonl", name: "turns.jsonl"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/.codex/logs_2.sqlite", name: "logs_2.sqlite"))
+        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/Logs/codex-plusplus-watcher.log", name: "codex-plusplus-watcher.log"))
     }
 
     func testSettingsExcludeCustomPathFragments() {
@@ -279,6 +426,156 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(paths, ["/tmp/project-sibling/keep.txt", "/tmp/project/new.txt"])
 
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testMergedRecordsReplacesOnlyChangedSubtreesAndPreservesOpenStats() {
+        let records = [
+            makeRecord(path: "/Users/me/Downloads", name: "Downloads", kind: .folder, ext: "", openCount: 2),
+            makeRecord(path: "/Users/me/Downloads/old.dmg", name: "old.dmg", ext: "dmg", openCount: 4),
+            makeRecord(path: "/Users/me/Documents/keep.md", name: "keep.md", ext: "md", openCount: 1),
+            makeRecord(path: "/Users/me/Downloads sibling/keep.txt", name: "keep.txt")
+        ]
+        let newRecords = [
+            makeRecord(path: "/Users/me/Downloads/new.dmg", name: "new.dmg", ext: "dmg"),
+            makeRecord(path: "/Users/me/Downloads/old.dmg", name: "old.dmg", ext: "dmg")
+        ]
+
+        let merged = SearchAppModel.mergedRecords(records, newRecords: newRecords, replacing: ["/Users/me/Downloads"])
+        let paths = Set(merged.map(\.path))
+
+        XCTAssertFalse(paths.contains("/Users/me/Downloads"))
+        XCTAssertTrue(paths.contains("/Users/me/Downloads/new.dmg"))
+        XCTAssertTrue(paths.contains("/Users/me/Documents/keep.md"))
+        XCTAssertTrue(paths.contains("/Users/me/Downloads sibling/keep.txt"))
+        XCTAssertEqual(merged.first { $0.path == "/Users/me/Downloads/old.dmg" }?.openCount, 4)
+    }
+
+    func testMergedRecordsTreatsFileEventsAsExactReplacements() {
+        let records = [
+            makeRecord(path: "/Users/me/Downloads", name: "Downloads", kind: .folder, ext: ""),
+            makeRecord(path: "/Users/me/Downloads/app.dmg", name: "app.dmg", ext: "dmg", openCount: 3),
+            makeRecord(path: "/Users/me/Downloads/app.dmg.meta", name: "app.dmg.meta", ext: "meta")
+        ]
+        let newRecords = [
+            makeRecord(path: "/Users/me/Downloads/app.dmg", name: "app.dmg", ext: "dmg")
+        ]
+
+        let merged = SearchAppModel.mergedRecords(records, newRecords: newRecords, replacing: ["/Users/me/Downloads/app.dmg"])
+        let paths = Set(merged.map(\.path))
+
+        XCTAssertTrue(paths.contains("/Users/me/Downloads"))
+        XCTAssertTrue(paths.contains("/Users/me/Downloads/app.dmg"))
+        XCTAssertTrue(paths.contains("/Users/me/Downloads/app.dmg.meta"))
+        XCTAssertEqual(merged.first { $0.path == "/Users/me/Downloads/app.dmg" }?.openCount, 3)
+    }
+
+    func testShouldReplaceUsesPathAncestorsInsteadOfPrefixSiblingMatches() {
+        let roots: Set<String> = ["/Users/me/Downloads"]
+
+        XCTAssertTrue(SearchAppModel.shouldReplace("/Users/me/Downloads", roots: roots))
+        XCTAssertTrue(SearchAppModel.shouldReplace("/Users/me/Downloads/PlayCover.dmg", roots: roots))
+        XCTAssertFalse(SearchAppModel.shouldReplace("/Users/me/Downloads sibling/keep.txt", roots: roots))
+    }
+
+    func testCompactedRescanPathsRemovesChildrenCoveredByParents() {
+        let compacted = SearchAppModel.compactedRescanPaths(
+            [
+                "/Users/me/Downloads",
+                "/Users/me/Downloads/PlayCover.dmg",
+                "/Users/me/Downloads/Nested/file.txt",
+                "/Users/me/Documents/report.md"
+            ],
+            indexedRoots: ["/Users/me"],
+            maxPaths: 512
+        )
+
+        XCTAssertEqual(compacted, ["/Users/me/Documents/report.md", "/Users/me/Downloads"])
+    }
+
+    func testCompactedRescanPathsPromotesEventStormsToIndexedRootChildren() {
+        let paths = (0..<700).map { "/Users/me/Downloads/build/file-\($0).tmp" }
+            + (0..<700).map { "/Users/me/Library/Caches/cache-\($0).db" }
+
+        let compacted = SearchAppModel.compactedRescanPaths(
+            paths,
+            indexedRoots: ["/Users/me"],
+            maxPaths: 128
+        )
+
+        XCTAssertEqual(compacted, ["/Users/me/Downloads", "/Users/me/Library"])
+    }
+
+    func testPreparedRescanPathsDropsInternalExcludedAndIndexedRootEvents() {
+        let settings = IndexSettings(
+            roots: ["/Users/me"],
+            excludedNamePatterns: [".omx"],
+            includeHiddenFiles: true
+        )
+
+        let prepared = SearchAppModel.preparedRescanPaths(
+            [
+                "/Users/me",
+                "/Users/me/.omx/state.json",
+                "/Users/me/Library/Application Support/Needle/index.sqlite-wal",
+                "/Users/me/Downloads/PlayCover.dmg"
+            ],
+            settings: settings,
+            internalExcludedRoots: ["/Users/me/Library/Application Support/Needle"],
+            maxPaths: 512
+        )
+
+        XCTAssertEqual(prepared, ["/Users/me/Downloads/PlayCover.dmg"])
+    }
+
+    func testBackgroundEventBufferAggregatesEventsOffMainActor() {
+        let buffer = BackgroundEventBuffer(pathLimit: 3)
+
+        XCTAssertFalse(buffer.enqueueIfBackground(FSEventsUpdate(paths: ["/tmp/a"], requiresFullRescan: false, reason: nil)))
+
+        buffer.enterBackground()
+
+        XCTAssertTrue(buffer.enqueueIfBackground(FSEventsUpdate(paths: ["/tmp/a"], requiresFullRescan: false, reason: nil)))
+        XCTAssertTrue(buffer.enqueueIfBackground(FSEventsUpdate(paths: ["/tmp/b", "/tmp/c"], requiresFullRescan: false, reason: nil)))
+
+        let drained = buffer.drainAndEnterForeground()
+        XCTAssertEqual(Set(drained?.paths ?? []), ["/tmp/a", "/tmp/b", "/tmp/c"])
+        XCTAssertEqual(drained?.requiresFullRescan, false)
+        XCTAssertFalse(buffer.enqueueIfBackground(FSEventsUpdate(paths: ["/tmp/d"], requiresFullRescan: false, reason: nil)))
+    }
+
+    func testBackgroundEventBufferPromotesOverflowToForegroundFullRescan() {
+        let buffer = BackgroundEventBuffer(pathLimit: 1)
+
+        buffer.enterBackground()
+        XCTAssertTrue(buffer.enqueueIfBackground(FSEventsUpdate(paths: ["/tmp/a", "/tmp/b"], requiresFullRescan: false, reason: nil)))
+
+        let drained = buffer.drainAndEnterForeground()
+        XCTAssertEqual(drained?.paths, [])
+        XCTAssertEqual(drained?.requiresFullRescan, true)
+        XCTAssertEqual(drained?.reason, "后台文件系统事件过多")
+    }
+
+    func testMergedRecordsHandlesLargeEventBatchesQuickly() {
+        let records = (0..<30_000).map { index in
+            makeRecord(
+                path: "/Users/me/Project\(index % 200)/Nested\(index % 50)/file-\(index).swift",
+                name: "file-\(index).swift",
+                ext: "swift",
+                openCount: index % 3
+            )
+        }
+        let replacing = (0..<400).map { "/Users/me/Project\($0 % 200)/Nested\($0 % 50)" }
+        let newRecords = (0..<400).map { index in
+            makeRecord(
+                path: "/Users/me/Project\(index % 200)/Nested\(index % 50)/new-\(index).swift",
+                name: "new-\(index).swift",
+                ext: "swift"
+            )
+        }
+
+        measure {
+            _ = SearchAppModel.mergedRecords(records, newRecords: newRecords, replacing: replacing)
+        }
     }
 }
 

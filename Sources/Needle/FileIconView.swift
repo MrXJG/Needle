@@ -30,6 +30,12 @@ private final class FileIconProvider {
 
     private init() {
         cache.countLimit = 768
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clearCache),
+            name: .needleDidUnloadForegroundResources,
+            object: nil
+        )
     }
 
     func icon(for record: FileRecord, mode: FileIconView.Mode) -> NSImage {
@@ -87,5 +93,9 @@ private final class FileIconProvider {
 
     private func contentType(for extensionName: String, fallback: UTType) -> UTType {
         UTType(filenameExtension: extensionName) ?? fallback
+    }
+
+    @objc private func clearCache() {
+        cache.removeAllObjects()
     }
 }

@@ -16,7 +16,12 @@ public final class AppPreferences: @unchecked Sendable {
         else {
             return IndexSettings()
         }
-        return settings
+        var migratedSettings = settings
+        migratedSettings.migrateIfNeeded()
+        if migratedSettings != settings {
+            save(migratedSettings)
+        }
+        return migratedSettings
     }
 
     public func save(_ settings: IndexSettings) {

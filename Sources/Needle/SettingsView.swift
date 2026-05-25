@@ -384,7 +384,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         case .watching:
-            Label("\(model.records.count.formatted()) 个项目", systemImage: "tray.full")
+            Label("\(model.indexedRecordCount.formatted()) 个项目", systemImage: "tray.full")
                 .foregroundStyle(.secondary)
         case .permissionBlocked:
             Label("部分位置需要权限", systemImage: "exclamationmark.triangle")

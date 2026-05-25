@@ -77,7 +77,7 @@ struct NeedleApp: App {
             if model.indexNeedsRebuild {
                 return "需要重建索引"
             }
-            return "索引已就绪，\(model.records.count.formatted()) 个项目"
+            return "索引已就绪，\(model.indexedRecordCount.formatted()) 个项目"
         case .permissionBlocked:
             return "部分目录无权限"
         case .degraded:

@@ -12,6 +12,10 @@ public struct SearchEngine: Sendable {
         guard !records.isEmpty else { return [] }
         guard limit > 0 else { return [] }
         guard query.invalidRegexPatterns.isEmpty else { return [] }
+        if query.terms.isEmpty, query.wildcardPatterns.isEmpty, query.regexPatterns.isEmpty {
+            return unrankedResults(records, query: query, limit: limit)
+        }
+
         let regexes = query.regexPatterns.compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
         guard regexes.count == query.regexPatterns.count else { return [] }
         let wildcardRegexes = query.wildcardPatterns.compactMap {
@@ -39,6 +43,26 @@ public struct SearchEngine: Sendable {
         }
 
         return topMatches.map(\.record)
+    }
+
+    private func unrankedResults(_ records: [FileRecord], query: SearchQuery, limit: Int) -> [FileRecord] {
+        guard query.kindFilter != .all || query.extensionFilter != nil else {
+            return Array(records.prefix(limit))
+        }
+
+        var results: [FileRecord] = []
+        results.reserveCapacity(limit)
+        for record in records {
+            guard kindMatches(record, filter: query.kindFilter) else { continue }
+            if let extensionFilter = query.extensionFilter, record.ext != extensionFilter {
+                continue
+            }
+            results.append(record)
+            if results.count == limit {
+                break
+            }
+        }
+        return results
     }
 
     private func insertTopMatch(
@@ -102,16 +126,7 @@ public struct SearchEngine: Sendable {
         wildcardRegexes: [NSRegularExpression],
         regexes: [NSRegularExpression]
     ) -> Bool {
-        switch query.kindFilter {
-        case .all:
-            break
-        case .files where record.kind != .file:
-            return false
-        case .folders where record.kind != .folder:
-            return false
-        default:
-            break
-        }
+        guard kindMatches(record, filter: query.kindFilter) else { return false }
 
         if let extensionFilter = query.extensionFilter, record.ext != extensionFilter {
             return false
@@ -122,7 +137,7 @@ public struct SearchEngine: Sendable {
         }
 
         let name = record.name.lowercased()
-        let path = record.path.lowercased()
+        let path = query.matchPath ? record.path.lowercased() : ""
         guard query.terms.allSatisfy({ term in
             name.contains(term) || (query.matchPath && path.contains(term))
         }) else {
@@ -140,6 +155,17 @@ public struct SearchEngine: Sendable {
         }
     }
 
+    private func kindMatches(_ record: FileRecord, filter: KindFilter) -> Bool {
+        switch filter {
+        case .all:
+            return true
+        case .files:
+            return record.kind == .file
+        case .folders:
+            return record.kind == .folder
+        }
+    }
+
     private func score(_ record: FileRecord, query: SearchQuery, preferredFolders: [PreferredFolder]) -> Int {
         guard !query.terms.isEmpty else {
             return 1
@@ -149,8 +175,8 @@ public struct SearchEngine: Sendable {
         }
 
         let name = record.name.lowercased()
-        let path = record.path.lowercased()
-        let stem = URL(fileURLWithPath: record.name).deletingPathExtension().lastPathComponent.lowercased()
+        let path = query.matchPath ? record.path.lowercased() : ""
+        let stem = lowercasedStem(from: record.name)
         var score = 0
 
         for term in query.terms {
@@ -164,7 +190,7 @@ public struct SearchEngine: Sendable {
                 score += 900
             } else if name.contains(term) {
                 score += 650
-            } else if path.contains(term) {
+            } else if query.matchPath && path.contains(term) {
                 score += 250
             }
         }
@@ -237,6 +263,13 @@ public struct SearchEngine: Sendable {
     private func matchesRegex(_ regex: NSRegularExpression, in text: String) -> Bool {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    private func lowercasedStem(from name: String) -> String {
+        guard let dotIndex = name.lastIndex(of: "."), dotIndex != name.startIndex else {
+            return name.lowercased()
+        }
+        return String(name[..<dotIndex]).lowercased()
     }
 
     private struct PreferredFolder {

@@ -165,7 +165,7 @@ public actor SQLiteStore {
 
     public func loadAll() throws -> [FileRecord] {
         let sql = """
-        SELECT path, name, parent_path, kind, ext, size, modified_at, volume_identifier, open_count, last_opened_at
+        SELECT path, name, kind, ext, size, modified_at, open_count, last_opened_at
         FROM files;
         """
         var statement: OpaquePointer?
@@ -221,7 +221,7 @@ public actor SQLiteStore {
         sqlite3_bind_text(statement, 5, record.ext, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(statement, 6, record.size)
         sqlite3_bind_double(statement, 7, record.modifiedAt.timeIntervalSince1970)
-        sqlite3_bind_text(statement, 8, record.volumeIdentifier, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 8, "", -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(statement, 9, Int32(record.openCount))
         if let lastOpenedAt = record.lastOpenedAt {
             sqlite3_bind_double(statement, 10, lastOpenedAt.timeIntervalSince1970)
@@ -234,14 +234,13 @@ public actor SQLiteStore {
         FileRecord(
             path: text(statement, 0),
             name: text(statement, 1),
-            parentPath: text(statement, 2),
-            kind: FileKind(rawValue: text(statement, 3)) ?? .other,
-            ext: text(statement, 4),
-            size: sqlite3_column_int64(statement, 5),
-            modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
-            volumeIdentifier: text(statement, 7),
-            openCount: Int(sqlite3_column_int(statement, 8)),
-            lastOpenedAt: optionalDate(statement, 9)
+            parentPath: "",
+            kind: FileKind(rawValue: text(statement, 2)) ?? .other,
+            ext: text(statement, 3),
+            size: sqlite3_column_int64(statement, 4),
+            modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 5)),
+            openCount: Int(sqlite3_column_int(statement, 6)),
+            lastOpenedAt: optionalDate(statement, 7)
         )
     }
 
