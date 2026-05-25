@@ -2,7 +2,7 @@
 
 ## Current Status
 - Status: Prototype usable, active polishing.
-- Last updated: 2026-05-24
+- Last updated: 2026-05-25
 - Build target: Native macOS 14+ SwiftUI app.
 - Distribution target: Developer ID signed DMG later; current local builds use ad-hoc signing.
 
@@ -17,12 +17,14 @@
 - Search ranking prioritizes exact filename matches, filename-stem matches, prefix matches, path-only matches, recent opens, and user-selected root proximity.
 - File/folder filters, path matching toggle, result sorting, right-click actions, open-with picker, Finder reveal, copy actions, drag support.
 - Quick Look preview pane with inspector-style metadata and Space key Quick Look from the result list.
+- Small text files can be previewed in a selectable/copyable text view inside the inspector pane.
 - Settings overlay for permissions, behavior, indexed locations, exclusion rules, search behavior, rebuild, login launch, global shortcut, and background behavior.
 - Settings sections use lighter native grouping with reduced nested card weight.
 - Settings exclusion rules support custom entries plus one-click common exclusions such as `.build`, `node_modules`, `.git`, `Library/Caches`, and `DerivedData`.
 - Settings clearly marks index-affecting changes that require rebuilding, and rebuild completion is shown temporarily in the main window and settings.
 - Settings provides a diagnostics section for opening the log directory and exporting a support report.
 - Diagnostics reports include search, rebuild, rescan, and FSEvents batch metrics.
+- Preview pane now uses proportional default width and more compact metadata ordering.
 - Menu bar/background running behavior with simplified status, open, settings, rebuild, shortcut, and quit actions.
 - DMG packaging, Developer ID signing hooks, notarization script, and release QA checklist are available.
 

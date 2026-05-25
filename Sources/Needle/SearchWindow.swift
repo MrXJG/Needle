@@ -14,6 +14,7 @@ struct SearchWindow: View {
     @State private var showPermissionGuide = false
     @State private var showIndexCompleted = false
     @State private var indexCompletionGeneration = 0
+    @State private var didResolveInitialPreviewWidth = false
     @AppStorage("previewPaneWidth") private var previewPaneWidth = 300.0
 
     private var selectedRecord: FileRecord? {
@@ -218,6 +219,7 @@ private extension SearchWindow {
                 }
                 Spacer()
                 statusView
+                    .frame(width: 118, alignment: .trailing)
             }
             .font(.callout)
         }
@@ -251,6 +253,7 @@ private extension SearchWindow {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 GeometryReader { proxy in
+                    let defaultWidth = defaultPreviewPaneWidth(totalWidth: proxy.size.width)
                     let width = clampedPreviewPaneWidth(totalWidth: proxy.size.width)
                     HStack(spacing: 0) {
                         ResultsList(
@@ -269,13 +272,19 @@ private extension SearchWindow {
 
                         SplitResizeHandle(
                             previewPaneWidth: $previewPaneWidth,
-                            defaultWidth: defaultPreviewPaneWidth,
+                            defaultWidth: defaultWidth,
                             minWidth: minPreviewPaneWidth,
                             maxWidth: maxPreviewPaneWidth(totalWidth: proxy.size.width)
                         )
 
                         PreviewPane(record: selectedRecord)
                             .frame(width: width)
+                    }
+                    .onAppear {
+                        resolveInitialPreviewWidth(totalWidth: proxy.size.width)
+                    }
+                    .onChange(of: proxy.size.width) { _, newWidth in
+                        resolveInitialPreviewWidth(totalWidth: newWidth)
                     }
                 }
             }
@@ -284,26 +293,31 @@ private extension SearchWindow {
 
     @ViewBuilder
     private var statusView: some View {
+        let hasVisibleQuery = !model.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
         if showIndexCompleted {
-            Label("已完成索引", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+            CompactStatusBadge(text: "已完成", systemName: "checkmark.circle.fill", tint: .green)
+        } else if model.isSearching && hasVisibleQuery {
+            SearchLoadingBadge()
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        } else if hasVisibleQuery && model.results.isEmpty {
+            CompactStatusBadge(text: "无结果", systemName: "magnifyingglass", tint: .secondary)
+        } else if hasVisibleQuery {
+            CompactStatusBadge(text: "已找到", systemName: "checkmark.circle.fill", tint: .green)
         } else if model.indexNeedsRebuild {
-            Label("需要重建索引", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                .foregroundStyle(.orange)
+            CompactStatusBadge(text: "需重建", systemName: "exclamationmark.arrow.triangle.2.circlepath", tint: .orange)
         } else {
             switch model.state {
         case .idle:
-            Text("未开始")
-                .foregroundStyle(.secondary)
+            CompactStatusBadge(text: "未开始", systemName: "circle", tint: .secondary)
         case .loading:
-            Label("正在加载索引", systemImage: "hourglass")
-                .foregroundStyle(.secondary)
+            CompactStatusBadge(text: "加载中", systemName: "hourglass", tint: .secondary)
         case .scanning(let processed):
-            Label("正在扫描 \(processed.formatted()) 项", systemImage: "arrow.triangle.2.circlepath")
-                .foregroundStyle(.orange)
+            CompactStatusBadge(text: "扫描中", systemName: "arrow.triangle.2.circlepath", tint: .orange)
+                .help("正在扫描 \(processed.formatted()) 项")
         case .watching:
-            Label("已索引 \(model.records.count.formatted()) 项", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+            CompactStatusBadge(text: "就绪", systemName: "checkmark.circle.fill", tint: .green)
+                .help("已索引 \(model.records.count.formatted()) 项")
         case .permissionBlocked:
             Button("授予完全磁盘访问权限") {
                 model.openPrivacySettings()
@@ -343,20 +357,35 @@ private extension SearchWindow {
 }
 
 private extension SearchWindow {
-    var defaultPreviewPaneWidth: Double { 300 }
-    var minPreviewPaneWidth: Double { 240 }
+    var minPreviewPaneWidth: Double { 300 }
     var minResultsWidth: Double { 520 }
+
+    func defaultPreviewPaneWidth(totalWidth: CGFloat) -> Double {
+        Double(totalWidth * 0.34).clamped(to: minPreviewPaneWidth...maxPreviewPaneWidth(totalWidth: totalWidth))
+    }
 
     func maxPreviewPaneWidth(totalWidth: CGFloat) -> Double {
         let availableWidth = Double(totalWidth)
         return max(
             minPreviewPaneWidth,
-            min(availableWidth * 0.45, availableWidth - minResultsWidth, 520)
+            min(availableWidth * 0.48, availableWidth - minResultsWidth, 560)
         )
     }
 
     func clampedPreviewPaneWidth(totalWidth: CGFloat) -> CGFloat {
         CGFloat(previewPaneWidth.clamped(to: minPreviewPaneWidth...maxPreviewPaneWidth(totalWidth: totalWidth)))
+    }
+
+    func resolveInitialPreviewWidth(totalWidth: CGFloat) {
+        guard !didResolveInitialPreviewWidth else { return }
+        didResolveInitialPreviewWidth = true
+
+        let proportionalWidth = defaultPreviewPaneWidth(totalWidth: totalWidth)
+        if abs(previewPaneWidth - 300) < 0.5 || abs(previewPaneWidth - 330.05859375) < 0.5 {
+            previewPaneWidth = proportionalWidth
+        } else {
+            previewPaneWidth = previewPaneWidth.clamped(to: minPreviewPaneWidth...maxPreviewPaneWidth(totalWidth: totalWidth))
+        }
     }
 }
 
@@ -523,6 +552,101 @@ private extension Comparable {
     }
 }
 
+private struct CompactStatusBadge: View {
+    let text: String
+    let systemName: String
+    let tint: Color
+
+    var body: some View {
+        Label(text, systemImage: systemName)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(tint.opacity(0.10), in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(tint.opacity(0.16))
+            }
+    }
+}
+
+private struct SearchLoadingBadge: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isAnimating = false
+
+    var body: some View {
+        HStack(spacing: 7) {
+            PacmanLoader(isAnimating: isAnimating && !reduceMotion)
+                .frame(width: 27, height: 14)
+                .accessibilityHidden(true)
+
+            Text("正在搜索")
+                .font(.callout.weight(.medium))
+        }
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(.orange.opacity(0.10), in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(.orange.opacity(0.18))
+        }
+        .accessibilityLabel("正在搜索")
+        .onAppear {
+            isAnimating = true
+        }
+    }
+}
+
+private struct PacmanLoader: View {
+    let isAnimating: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !isAnimating)) { timeline in
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            let mouth = isAnimating ? (0.26 + 0.18 * abs(sin(time * 8))) : 0.26
+            let offset = isAnimating ? CGFloat((time * 28).truncatingRemainder(dividingBy: 14)) : 0
+
+            ZStack(alignment: .leading) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(.orange.opacity(0.45))
+                        .frame(width: 3.5, height: 3.5)
+                        .offset(x: 14 + CGFloat(index * 7) - offset, y: 5.25)
+                }
+
+                PacmanShape(mouth: mouth)
+                    .fill(.orange)
+                    .frame(width: 14, height: 14)
+            }
+        }
+    }
+}
+
+private struct PacmanShape: Shape {
+    var mouth: Double
+
+    var animatableData: Double {
+        get { mouth }
+        set { mouth = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2
+        let start = Angle.radians(mouth)
+        let end = Angle.radians((Double.pi * 2) - mouth)
+
+        var path = Path()
+        path.move(to: center)
+        path.addArc(center: center, radius: radius, startAngle: start, endAngle: end, clockwise: false)
+        path.closeSubpath()
+        return path
+    }
+}
+
 struct ResultsList: View {
     let results: [FileRecord]
     @Binding var selection: FileRecord.ID?
@@ -594,7 +718,6 @@ struct ResultsList: View {
             }
             .width(110)
         }
-        .disableHorizontalScrollIndicators()
         .contextMenu(forSelectionType: FileRecord.ID.self) { selectedIDs in
             if let record = displayedResults.first(where: { selectedIDs.contains($0.id) }) {
                 Button("打开") { open(record) }
@@ -672,72 +795,9 @@ private extension FileRecord {
     }
 }
 
-private struct HorizontalScrollIndicatorDisabler: NSViewRepresentable {
-    final class Coordinator {
-        var didConfigure = false
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async {
-            disableHorizontalScrollers(near: view, coordinator: context.coordinator)
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        guard !context.coordinator.didConfigure else { return }
-        DispatchQueue.main.async {
-            disableHorizontalScrollers(near: nsView, coordinator: context.coordinator)
-        }
-    }
-
-    private func disableHorizontalScrollers(near view: NSView, coordinator: Coordinator) {
-        guard !coordinator.didConfigure else { return }
-
-        var current: NSView? = view
-        while let node = current {
-            if let scrollView = node as? NSScrollView {
-                scrollView.hasHorizontalScroller = false
-                scrollView.horizontalScrollElasticity = .none
-                scrollView.autohidesScrollers = true
-                coordinator.didConfigure = true
-                return
-            }
-            current = node.superview
-        }
-
-        view.window?.contentView?.subviewsRecursive.forEach { node in
-            guard let scrollView = node as? NSScrollView else { return }
-            if scrollView.documentView is NSTableView {
-                scrollView.hasHorizontalScroller = false
-                scrollView.horizontalScrollElasticity = .none
-                scrollView.autohidesScrollers = true
-                coordinator.didConfigure = true
-            }
-        }
-    }
-}
-
-private extension NSView {
-    var subviewsRecursive: [NSView] {
-        subviews + subviews.flatMap(\.subviewsRecursive)
-    }
-}
-
-private extension View {
-    func disableHorizontalScrollIndicators() -> some View {
-        background(HorizontalScrollIndicatorDisabler())
-    }
-}
-
 private struct SpaceKeyPreviewMonitor: NSViewRepresentable {
     let isEnabled: Bool
-    let previewSelectedRecord: @MainActor () -> Void
+    let previewSelectedRecord: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -757,7 +817,7 @@ private struct SpaceKeyPreviewMonitor: NSViewRepresentable {
 
     final class Coordinator {
         var isEnabled = true
-        var previewSelectedRecord: (@MainActor () -> Void)?
+        var previewSelectedRecord: (() -> Void)?
         private weak var view: NSView?
         private var monitor: Any?
 
@@ -772,19 +832,40 @@ private struct SpaceKeyPreviewMonitor: NSViewRepresentable {
             guard monitor == nil else { return }
 
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, self.shouldPreview(for: event) else {
-                    return event
-                }
+                guard let self else { return event }
+                let keyCode = event.keyCode
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                let eventWindow = event.window
+                let isEnabled = self.isEnabled
+                let view = self.view
+                let previewSelectedRecord = self.previewSelectedRecord
 
-                self.previewSelectedRecord?()
+                let shouldConsume = MainActor.assumeIsolated {
+                    Self.shouldPreview(
+                        isEnabled: isEnabled,
+                        keyCode: keyCode,
+                        flags: flags,
+                        eventWindow: eventWindow,
+                        view: view
+                    )
+                }
+                guard shouldConsume else { return event }
+                previewSelectedRecord?()
                 return nil
             }
         }
 
-        private func shouldPreview(for event: NSEvent) -> Bool {
-            guard isEnabled, event.keyCode == 49 else { return false }
-            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty else { return false }
-            guard let window = view?.window, event.window === window else { return false }
+        @MainActor
+        private static func shouldPreview(
+            isEnabled: Bool,
+            keyCode: UInt16,
+            flags: NSEvent.ModifierFlags,
+            eventWindow: NSWindow?,
+            view: NSView?
+        ) -> Bool {
+            guard isEnabled, keyCode == 49 else { return false }
+            guard flags.isEmpty else { return false }
+            guard let window = view?.window, eventWindow === window else { return false }
             guard !(window.firstResponder is NSTextView) else { return false }
             return true
         }
@@ -795,6 +876,12 @@ struct PreviewPane: View {
     let record: FileRecord?
     @State private var folderSizeState = FolderSizeState.idle
     @State private var folderSizeTask: Task<Void, Never>?
+    @State private var inlinePreviewURL: URL?
+    @State private var textPreview = TextPreviewState.idle
+    @State private var inlinePreviewTask: Task<Void, Never>?
+    @State private var extraMetadata = PreviewExtraMetadata.loading
+    @State private var extraMetadataTask: Task<Void, Never>?
+    @State private var showLocationPopover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -815,13 +902,7 @@ struct PreviewPane: View {
 
                 metadataGroup(for: record)
 
-                QuickLookPreview(url: URL(fileURLWithPath: record.path))
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(.quaternary)
-                    }
-                    .frame(minHeight: 180)
+                inlinePreview(for: record)
             } else {
                 ContentUnavailableView("未选择文件", systemImage: "doc.text.magnifyingglass")
             }
@@ -830,29 +911,39 @@ struct PreviewPane: View {
         .padding(18)
         .onAppear {
             startFolderSizeIfNeeded(for: record)
+            startInlinePreviewIfNeeded(for: record)
+            startExtraMetadataIfNeeded(for: record)
         }
         .onChange(of: record?.id) { _, _ in
             startFolderSizeIfNeeded(for: record)
+            startInlinePreviewIfNeeded(for: record)
+            startExtraMetadataIfNeeded(for: record)
         }
         .onDisappear {
             folderSizeTask?.cancel()
+            inlinePreviewTask?.cancel()
+            extraMetadataTask?.cancel()
         }
     }
 
     private func metadataGroup(for record: FileRecord) -> some View {
         VStack(spacing: 0) {
-            metadataRow("位置", record.parentPath, lineLimit: 2)
+            locationMetadata(for: record)
             PreviewMetadataDivider()
             sizeMetadata(for: record)
+            if let permissionSummary = extraMetadata.permissionSummary {
+                PreviewMetadataDivider()
+                metadataRow("访问权限", permissionSummary)
+            }
+            if let createdAt = extraMetadata.createdAt {
+                PreviewMetadataDivider()
+                metadataRow("创建时间", createdAt.formatted(date: .abbreviated, time: .shortened))
+            }
             PreviewMetadataDivider()
             metadataRow("修改时间", record.modifiedAt.formatted(date: .abbreviated, time: .shortened))
             if let lastOpenedAt = record.lastOpenedAt {
                 PreviewMetadataDivider()
                 metadataRow("最近打开", lastOpenedAt.formatted(date: .abbreviated, time: .shortened))
-            }
-            if record.openCount > 0 {
-                PreviewMetadataDivider()
-                metadataRow("打开次数", "\(record.openCount.formatted()) 次")
             }
         }
         .padding(.vertical, 2)
@@ -860,6 +951,35 @@ struct PreviewPane: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(.quaternary)
+        }
+    }
+
+    private func locationMetadata(for record: FileRecord) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            metadataTitle("位置")
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(locationTitle(for: record.parentPath))
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(compactPath(record.parentPath))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .clipped()
+        }
+        .contentShape(Rectangle())
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .onHover { isHovering in
+            showLocationPopover = isHovering
+        }
+        .popover(isPresented: $showLocationPopover, arrowEdge: .trailing) {
+            LocationPathPopover(path: record.path)
         }
     }
 
@@ -897,13 +1017,24 @@ struct PreviewPane: View {
             Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
                 .font(.callout)
                 .textSelection(.enabled)
+        case .tooLarge:
+            HStack(spacing: 8) {
+                Text("较大目录")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("继续计算") {
+                    calculateFolderSize(for: record, mode: .full)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+            }
         case .failed:
             HStack(spacing: 8) {
                 Text("无法计算")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Button("重试") {
-                    calculateFolderSize(for: record)
+                    calculateFolderSize(for: record, mode: .bounded)
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
@@ -933,6 +1064,50 @@ struct PreviewPane: View {
             .frame(width: 52, alignment: .leading)
     }
 
+    private func locationTitle(for path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        let lastComponent = url.lastPathComponent
+        guard !lastComponent.isEmpty else { return path }
+        return lastComponent
+    }
+
+    private func displayPath(_ path: String) -> String {
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == homePath {
+            return "~"
+        } else if path.hasPrefix(homePath + "/") {
+            return "~/" + String(path.dropFirst(homePath.count + 1))
+        }
+        return path
+    }
+
+    private func compactPath(_ path: String) -> String {
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+        let displayPath: String
+        if path == homePath {
+            return "~"
+        } else if path.hasPrefix(homePath + "/") {
+            displayPath = "~/" + String(path.dropFirst(homePath.count + 1))
+        } else {
+            displayPath = path
+        }
+
+        let separator = CharacterSet(charactersIn: "/")
+        let isHomeRelative = displayPath.hasPrefix("~/")
+        let components = displayPath
+            .trimmingCharacters(in: separator)
+            .split(separator: "/")
+            .map(String.init)
+
+        guard components.count > 4 else {
+            return displayPath
+        }
+
+        let prefix = isHomeRelative ? "~" : (displayPath.hasPrefix("/") ? "/" : components[0])
+        let suffix = components.suffix(2).joined(separator: "/")
+        return prefix == "/" ? "/.../\(suffix)" : "\(prefix)/.../\(suffix)"
+    }
+
     private func displayKind(_ kind: FileKind) -> String {
         switch kind {
         case .file:
@@ -947,7 +1122,13 @@ struct PreviewPane: View {
     private func startFolderSizeIfNeeded(for record: FileRecord?) {
         resetFolderSize()
         guard let record, record.kind == .folder else { return }
-        calculateFolderSize(for: record)
+        folderSizeTask = Task {
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                calculateFolderSize(for: record, mode: .bounded)
+            }
+        }
     }
 
     private func resetFolderSize() {
@@ -956,16 +1137,128 @@ struct PreviewPane: View {
         folderSizeState = .idle
     }
 
-    private func calculateFolderSize(for record: FileRecord) {
+    private func startExtraMetadataIfNeeded(for record: FileRecord?) {
+        extraMetadataTask?.cancel()
+        extraMetadata = .loading
+        guard let record else { return }
+        let path = record.path
+        extraMetadataTask = Task {
+            let metadata = await Task.detached(priority: .utility) {
+                PreviewExtraMetadata.load(path: path)
+            }.value
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.extraMetadata = metadata
+            }
+        }
+    }
+
+    private func calculateFolderSize(for record: FileRecord, mode: DirectorySizeCalculator.Mode) {
         folderSizeTask?.cancel()
         folderSizeState = .calculating
         let path = record.path
 
         folderSizeTask = Task {
-            let size = await DirectorySizeCalculator.calculate(path: path)
+            let result = await DirectorySizeCalculator.calculate(path: path, mode: mode)
             guard !Task.isCancelled else { return }
-            folderSizeState = size.map(FolderSizeState.finished) ?? .failed
+            folderSizeState = FolderSizeState(result)
         }
+    }
+
+    @ViewBuilder
+    private func inlinePreview(for record: FileRecord) -> some View {
+        ZStack {
+            if case .loaded(let text) = textPreview {
+                SelectableTextPreview(text: text)
+            } else if case .loading = textPreview {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在读取文本")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.32))
+            } else if let inlinePreviewURL {
+                QuickLookPreview(url: inlinePreviewURL)
+            } else {
+                VStack(spacing: 12) {
+                    FileIconView(record: record, mode: .preview, size: 96)
+                    Text(inlinePreviewPlaceholderText(for: record))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .controlBackgroundColor).opacity(0.32))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.quaternary)
+        }
+        .frame(minHeight: 180)
+    }
+
+    private func startInlinePreviewIfNeeded(for record: FileRecord?) {
+        inlinePreviewTask?.cancel()
+        inlinePreviewTask = nil
+        inlinePreviewURL = nil
+        textPreview = .idle
+
+        guard let record else { return }
+        let url = URL(fileURLWithPath: record.path)
+        if shouldAutoloadTextPreview(for: record) {
+            textPreview = .loading
+            inlinePreviewTask = Task {
+                let preview = TextPreviewLoader.load(url: url)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    switch preview {
+                    case .success(let text):
+                        textPreview = .loaded(text)
+                    case .failure:
+                        textPreview = .idle
+                        inlinePreviewURL = url
+                    }
+                }
+            }
+            return
+        }
+
+        guard shouldAutoloadInlinePreview(for: record) else { return }
+        inlinePreviewTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                inlinePreviewURL = url
+            }
+        }
+    }
+
+    private func shouldAutoloadInlinePreview(for record: FileRecord) -> Bool {
+        guard record.kind == .file else { return false }
+        let previewBudget: Int64 = 25 * 1024 * 1024
+        return record.size <= previewBudget
+    }
+
+    private func shouldAutoloadTextPreview(for record: FileRecord) -> Bool {
+        guard record.kind == .file else { return false }
+        let textPreviewBudget: Int64 = 1 * 1024 * 1024
+        guard record.size <= textPreviewBudget else { return false }
+        if TextPreviewLoader.textExtensions.contains(record.ext) {
+            return true
+        }
+        return record.ext.isEmpty && record.size <= 128 * 1024
+    }
+
+    private func inlinePreviewPlaceholderText(for record: FileRecord) -> String {
+        if record.kind == .folder {
+            return "按空格快速预览文件夹"
+        }
+        return "大文件不会自动生成预览，按空格快速预览"
     }
 }
 
@@ -976,15 +1269,157 @@ private struct PreviewMetadataDivider: View {
     }
 }
 
+private struct LocationPathPopover: View {
+    let path: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("完整路径")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(path)
+                .font(.callout)
+                .textSelection(.enabled)
+                .lineLimit(4)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .frame(width: 360, alignment: .leading)
+    }
+}
+
+private struct PreviewExtraMetadata: Sendable {
+    var createdAt: Date?
+    var permissionSummary: String?
+
+    static let loading = PreviewExtraMetadata(createdAt: nil, permissionSummary: nil)
+
+    static func load(path: String) -> PreviewExtraMetadata {
+        let fileManager = FileManager.default
+        let attributes = try? fileManager.attributesOfItem(atPath: path)
+        let createdAt = attributes?[.creationDate] as? Date
+
+        let permissionSummary: String
+        if !fileManager.fileExists(atPath: path) {
+            permissionSummary = "不可用"
+        } else if fileManager.isReadableFile(atPath: path), fileManager.isWritableFile(atPath: path) {
+            permissionSummary = "可读写"
+        } else if fileManager.isReadableFile(atPath: path) {
+            permissionSummary = "只读"
+        } else {
+            permissionSummary = "无读取权限"
+        }
+
+        return PreviewExtraMetadata(
+            createdAt: createdAt,
+            permissionSummary: permissionSummary
+        )
+    }
+}
+
+private enum TextPreviewState: Equatable {
+    case idle
+    case loading
+    case loaded(String)
+}
+
+private struct SelectableTextPreview: View {
+    @State var text: String
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.system(.body, design: .monospaced))
+            .scrollContentBackground(.hidden)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.72))
+            .textSelection(.enabled)
+            .disabled(false)
+    }
+}
+
+private enum TextPreviewLoader {
+    static let textExtensions: Set<String> = [
+        "txt", "md", "markdown", "json", "jsonl", "xml", "yaml", "yml",
+        "toml", "ini", "cfg", "conf", "log", "csv", "tsv",
+        "swift", "m", "mm", "h", "hpp", "c", "cc", "cpp",
+        "py", "rb", "go", "rs", "java", "kt", "kts",
+        "js", "jsx", "ts", "tsx", "css", "scss", "html", "htm",
+        "sh", "zsh", "bash", "fish", "sql", "env", "plist"
+    ]
+    private static let maxBytes = 1 * 1024 * 1024
+    private static let maxCharacters = 80_000
+
+    static func load(url: URL) -> Result<String, Error> {
+        do {
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard data.count <= maxBytes else {
+                return .failure(TextPreviewError.tooLarge)
+            }
+            guard !looksBinary(data) else {
+                return .failure(TextPreviewError.binary)
+            }
+            let text = decode(data)
+            return .success(String(text.prefix(maxCharacters)))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    private static func decode(_ data: Data) -> String {
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        if let text = String(data: data, encoding: .utf16) {
+            return text
+        }
+        if let text = String(data: data, encoding: .isoLatin1) {
+            return text
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func looksBinary(_ data: Data) -> Bool {
+        data.prefix(4096).contains(0)
+    }
+
+    private enum TextPreviewError: Error {
+        case tooLarge
+        case binary
+    }
+}
+
 private enum FolderSizeState: Equatable {
     case idle
     case calculating
     case finished(Int64)
+    case tooLarge
     case failed
+
+    init(_ result: DirectorySizeCalculator.Result) {
+        switch result {
+        case .finished(let size):
+            self = .finished(size)
+        case .tooLarge:
+            self = .tooLarge
+        case .failed:
+            self = .failed
+        }
+    }
 }
 
 private enum DirectorySizeCalculator {
-    static func calculate(path: String) async -> Int64? {
+    enum Mode {
+        case bounded
+        case full
+    }
+
+    enum Result {
+        case finished(Int64)
+        case tooLarge
+        case failed
+    }
+
+    static func calculate(path: String, mode: Mode) async -> Result {
         await Task.detached(priority: .utility) {
             let rootURL = URL(fileURLWithPath: path)
             let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .totalFileAllocatedSizeKey]
@@ -994,13 +1429,22 @@ private enum DirectorySizeCalculator {
                 options: [],
                 errorHandler: { _, _ in true }
             ) else {
-                return nil
+                return .failed
             }
 
             var total: Int64 = 0
+            var visited = 0
+            let startedAt = CFAbsoluteTimeGetCurrent()
             while let fileURL = enumerator.nextObject() as? URL {
                 if Task.isCancelled {
-                    return nil
+                    return .failed
+                }
+
+                visited += 1
+                if mode == .bounded {
+                    if visited > 4_000 || (CFAbsoluteTimeGetCurrent() - startedAt) > 0.45 {
+                        return .tooLarge
+                    }
                 }
 
                 guard
@@ -1014,7 +1458,7 @@ private enum DirectorySizeCalculator {
                 total += Int64(size)
             }
 
-            return total
+            return .finished(total)
         }.value
     }
 }

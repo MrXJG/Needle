@@ -116,15 +116,30 @@ public actor SQLiteStore {
         }
     }
 
+    public func replaceSubtrees(paths: [String], with records: [FileRecord]) throws {
+        try execute("BEGIN TRANSACTION;")
+        do {
+            try delete(paths: paths)
+            try upsert(records)
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     public func delete(paths: [String]) throws {
         guard !paths.isEmpty else { return }
         var statement: OpaquePointer?
-        try prepare("DELETE FROM files WHERE path = ? OR path LIKE ?;", statement: &statement)
+        try prepare("DELETE FROM files WHERE path = ? OR (path >= ? AND path < ?);", statement: &statement)
         defer { sqlite3_finalize(statement) }
 
         for path in paths {
+            let lowerBound = path + "/"
+            let upperBound = lowerBound + "\u{10FFFF}"
             sqlite3_bind_text(statement, 1, path, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_text(statement, 2, path + "/%", -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(statement, 2, lowerBound, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(statement, 3, upperBound, -1, SQLITE_TRANSIENT)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw SQLiteStoreError.executeFailed(lastErrorMessage)
             }

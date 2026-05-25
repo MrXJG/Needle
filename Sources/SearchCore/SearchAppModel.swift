@@ -18,15 +18,16 @@ public final class SearchAppModel {
     public private(set) var lastRebuildDurationMS: Double?
     public private(set) var lastRescanDurationMS: Double?
     public private(set) var lastFSEventBatchCount: Int?
+    public private(set) var isSearching = false
 
     public var queryText: String = "" {
-        didSet { scheduleSearch() }
+        didSet { scheduleSearch(showActivity: true) }
     }
     public var kindFilter: KindFilter = .all {
-        didSet { scheduleSearch() }
+        didSet { scheduleSearch(showActivity: true) }
     }
     public var matchPath = true {
-        didSet { scheduleSearch() }
+        didSet { scheduleSearch(showActivity: true) }
     }
     public var settings: IndexSettings {
         didSet {
@@ -53,7 +54,11 @@ public final class SearchAppModel {
     private let watcher: FSEventsWatcher
     private let modelBox: ModelBox
     private var rescanTask: Task<Void, Never>?
+    private var pendingRescanPaths = Set<String>()
+    private var isRescanning = false
+    private var needsSearchAfterRescan = false
     private var searchTask: Task<Void, Never>?
+    private var searchActivityTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var workspaceObservers: [NSObjectProtocol] = []
 
@@ -96,7 +101,7 @@ public final class SearchAppModel {
         do {
             try await store.open()
             records = try await store.loadAll()
-            searchNow()
+            refreshResults()
             startWatching()
             if records.isEmpty && !settings.roots.isEmpty {
                 await rebuildIndex()
@@ -114,6 +119,7 @@ public final class SearchAppModel {
         guard !settings.roots.isEmpty else {
             records = []
             results = []
+            stopSearchActivity()
             state = .idle
             return
         }
@@ -139,7 +145,7 @@ public final class SearchAppModel {
             blockedPaths = result.blockedPaths
             indexedSettings = currentSettings
             lastRebuildDurationMS = elapsedMilliseconds(since: startedAt)
-            searchNow()
+            await refreshResultsImmediately()
             startWatching()
             state = result.blockedPaths.isEmpty ? .watching : .permissionBlocked(result.blockedPaths.first ?? "部分目录无法访问")
         } catch {
@@ -260,11 +266,11 @@ public final class SearchAppModel {
         permissionStatus = PermissionStatusProvider.current()
     }
 
-    private func refreshResults() {
-        searchNow()
+    private func refreshResults(showActivity: Bool = false) {
+        scheduleSearch(delay: .milliseconds(0), showActivity: showActivity)
     }
 
-    private func scheduleSearch() {
+    private func refreshResultsImmediately() async {
         searchGeneration += 1
         let generation = searchGeneration
         let records = records
@@ -274,34 +280,89 @@ public final class SearchAppModel {
         queryWarning = query.validationMessage
 
         searchTask?.cancel()
+        stopSearchActivity()
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let newResults = await Task.detached(priority: .userInitiated) {
+            searchEngine.search(records, query: query, preferredFolderPaths: preferredFolderPaths)
+        }.value
+
+        guard searchGeneration == generation else { return }
+        results = newResults
+        lastSearchDurationMS = elapsedMilliseconds(since: startedAt)
+        stopSearchActivity()
+    }
+
+    private func scheduleSearch(showActivity: Bool) {
+        scheduleSearch(delay: .milliseconds(80), showActivity: showActivity)
+    }
+
+    private func scheduleSearch(delay: Duration, showActivity: Bool) {
+        searchGeneration += 1
+        let generation = searchGeneration
+        let records = records
+        let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
+        let searchEngine = searchEngine
+        let preferredFolderPaths = settings.roots
+        queryWarning = query.validationMessage
+
+        searchTask?.cancel()
+        if showActivity {
+            beginSearchActivityIfSlow(generation: generation)
+        } else {
+            stopSearchActivity()
+        }
+        guard !isRescanning else {
+            needsSearchAfterRescan = true
+            return
+        }
+
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(80))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
 
-            let results = await Task.detached(priority: .userInitiated) {
+            let searchJob = Task.detached(priority: .userInitiated) {
                 let startedAt = CFAbsoluteTimeGetCurrent()
                 let results = searchEngine.search(records, query: query, preferredFolderPaths: preferredFolderPaths)
                 let duration = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
                 return (results, duration)
-            }.value
+            }
+
+            let results = await withTaskCancellationHandler {
+                await searchJob.value
+            } onCancel: {
+                searchJob.cancel()
+            }
 
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.searchGeneration == generation else { return }
                 self.results = results.0
                 self.lastSearchDurationMS = results.1
+                self.stopSearchActivity()
             }
         }
     }
 
-    private func searchNow() {
-        searchGeneration += 1
-        searchTask?.cancel()
-        let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
-        queryWarning = query.validationMessage
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        results = searchEngine.search(records, query: query, preferredFolderPaths: settings.roots)
-        lastSearchDurationMS = elapsedMilliseconds(since: startedAt)
+    private func beginSearchActivityIfSlow(generation: Int) {
+        searchActivityTask?.cancel()
+        isSearching = false
+        guard !records.isEmpty else { return }
+
+        searchActivityTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.searchGeneration == generation else { return }
+                self.isSearching = true
+            }
+        }
+    }
+
+    private func stopSearchActivity() {
+        searchActivityTask?.cancel()
+        searchActivityTask = nil
+        isSearching = false
     }
 
     private func noteRecordOpened(path: String, at date: Date = Date()) {
@@ -456,10 +517,29 @@ public final class SearchAppModel {
 
     private func scheduleRescan(paths: [String]) {
         lastFSEventBatchCount = paths.count
+        pendingRescanPaths.formUnion(paths)
         rescanTask?.cancel()
         rescanTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
-            await self?.rescan(paths: paths)
+            await self?.runPendingRescan()
+        }
+    }
+
+    private func runPendingRescan() async {
+        guard !isRescanning else { return }
+        guard !pendingRescanPaths.isEmpty else { return }
+
+        let paths = Array(pendingRescanPaths)
+        pendingRescanPaths.removeAll()
+        isRescanning = true
+        await rescan(paths: paths)
+        isRescanning = false
+
+        if !pendingRescanPaths.isEmpty {
+            scheduleRescan(paths: [])
+        } else if needsSearchAfterRescan {
+            needsSearchAfterRescan = false
+            refreshResults(showActivity: false)
         }
     }
 
@@ -468,7 +548,7 @@ public final class SearchAppModel {
         let uniquePaths = Array(Set(paths))
         let currentSettings = settings
         let indexer = indexer
-        let newRecords = await withTaskGroup(of: [FileRecord].self) { group in
+        let scannedRecords = await withTaskGroup(of: [FileRecord].self) { group in
             for path in uniquePaths {
                 group.addTask {
                     await indexer.scanSinglePath(path, settings: currentSettings)
@@ -480,17 +560,91 @@ public final class SearchAppModel {
             }
             return collected
         }
+        let newRecords = Self.deduplicatedRecords(scannedRecords)
 
         do {
-            try await store.delete(paths: uniquePaths)
-            try await store.upsert(newRecords)
-            records = try await store.loadAll()
+            try await store.replaceSubtrees(paths: uniquePaths, with: newRecords)
+            let currentRecords = records
+            records = await Task.detached(priority: .utility) {
+                Self.mergedRecords(currentRecords, newRecords: newRecords, replacing: uniquePaths)
+            }.value
             lastRescanDurationMS = elapsedMilliseconds(since: startedAt)
-            refreshResults()
+            refreshResults(showActivity: false)
             state = .watching
         } catch {
             lastError = error.localizedDescription
             state = .degraded(error.localizedDescription)
+        }
+    }
+
+    nonisolated private static func mergedRecords(
+        _ records: [FileRecord],
+        newRecords: [FileRecord],
+        replacing paths: [String]
+    ) -> [FileRecord] {
+        var openStatsByPath: [String: (openCount: Int, lastOpenedAt: Date?)] = [:]
+        openStatsByPath.reserveCapacity(records.count)
+
+        for record in records {
+            let existing = openStatsByPath[record.path]
+            openStatsByPath[record.path] = (
+                openCount: max(existing?.openCount ?? 0, record.openCount),
+                lastOpenedAt: latestDate(existing?.lastOpenedAt, record.lastOpenedAt)
+            )
+        }
+
+        let replacementRoots = Set(paths)
+        let replacementPrefixes = paths.map { $0 + "/" }
+        var mergedRecords: [FileRecord] = []
+        mergedRecords.reserveCapacity(max(records.count, records.count - paths.count + newRecords.count))
+
+        for record in records {
+            guard !shouldReplace(record.path, roots: replacementRoots, prefixes: replacementPrefixes) else {
+                continue
+            }
+            mergedRecords.append(record)
+        }
+
+        let recordsWithPreservedOpenStats = newRecords.map { record in
+            var record = record
+            if let stats = openStatsByPath[record.path] {
+                record.openCount = stats.openCount
+                record.lastOpenedAt = stats.lastOpenedAt
+            }
+            return record
+        }
+
+        mergedRecords.append(contentsOf: recordsWithPreservedOpenStats)
+        return mergedRecords
+    }
+
+    nonisolated private static func shouldReplace(
+        _ path: String,
+        roots: Set<String>,
+        prefixes: [String]
+    ) -> Bool {
+        roots.contains(path) || prefixes.contains { path.hasPrefix($0) }
+    }
+
+    nonisolated private static func deduplicatedRecords(_ records: [FileRecord]) -> [FileRecord] {
+        var recordsByPath: [String: FileRecord] = [:]
+        recordsByPath.reserveCapacity(records.count)
+
+        for record in records {
+            recordsByPath[record.path] = record
+        }
+
+        return Array(recordsByPath.values)
+    }
+
+    nonisolated private static func latestDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
+        switch (lhs, rhs) {
+        case (.none, .none):
+            return nil
+        case (.some(let date), .none), (.none, .some(let date)):
+            return date
+        case (.some(let lhs), .some(let rhs)):
+            return max(lhs, rhs)
         }
     }
 

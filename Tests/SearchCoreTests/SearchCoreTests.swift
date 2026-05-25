@@ -95,6 +95,17 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(results.first?.path, "/Users/me/work/report.txt")
     }
 
+    func testSearchLimitKeepsHighestRankedResults() {
+        let engine = SearchEngine()
+        let records = (0..<80).map { index in
+            makeRecord(path: "/Users/me/archive/report-\(index).txt", name: "report-\(index).txt", openCount: index)
+        }
+
+        let results = engine.search(records, query: .parse("report"), limit: 5)
+
+        XCTAssertEqual(results.map(\.openCount), [79, 78, 77, 76, 75])
+    }
+
     func testFiltersByKindAndExtension() {
         let engine = SearchEngine()
         let records = [
@@ -124,6 +135,48 @@ final class SearchCoreTests: XCTestCase {
 
         let regexResults = engine.search(records, query: .parse("re:^archive\\.tar\\.gz$"))
         XCTAssertEqual(regexResults.map(\.path), ["/tmp/pkg/archive.tar.gz"])
+    }
+
+    func testSearchMatchesDottedUnderscoreReleaseNames() {
+        let engine = SearchEngine()
+        let records = [
+            makeRecord(path: "/Users/me/Downloads/PlayCover_3.1.0.dmg", name: "PlayCover_3.1.0.dmg", ext: "dmg")
+        ]
+
+        let query = SearchQuery.parse("PlayCover_3.1.0")
+        let results = engine.search(records, query: query)
+
+        XCTAssertEqual(query.terms, ["playcover_3.1.0"])
+        XCTAssertEqual(results.map(\.path), ["/Users/me/Downloads/PlayCover_3.1.0.dmg"])
+    }
+
+    @MainActor
+    func testRebuildRefreshesResultsBeforeReportingCompletion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let downloads = directory.appendingPathComponent("Downloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
+        let fileURL = downloads.appendingPathComponent("PlayCover_3.1.0.dmg")
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "PlayCover_3.1.0"
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertEqual(model.state, .watching)
+        XCTAssertFalse(model.isSearching)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        model.queryText = "missing"
+        XCTAssertFalse(model.isSearching)
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertFalse(model.isSearching)
+
+        try? FileManager.default.removeItem(at: directory)
     }
 
     func testSettingsDefaultToNoRootsForSafeFirstLaunch() {
@@ -200,6 +253,30 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(records.count, 1)
         XCTAssertEqual(records.first?.openCount, 1)
         XCTAssertEqual(records.first?.lastOpenedAt, openedAt)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testSQLiteReplaceSubtreesDeletesChildrenAndUpsertsRecords() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let url = directory.appendingPathComponent("index.sqlite")
+        let store = SQLiteStore(databaseURL: url)
+        try await store.open()
+
+        try await store.upsert([
+            makeRecord(path: "/tmp/project", name: "project", kind: .folder, ext: ""),
+            makeRecord(path: "/tmp/project/old.txt", name: "old.txt"),
+            makeRecord(path: "/tmp/project/nested/old.txt", name: "old.txt"),
+            makeRecord(path: "/tmp/project-sibling/keep.txt", name: "keep.txt")
+        ])
+
+        try await store.replaceSubtrees(
+            paths: ["/tmp/project"],
+            with: [makeRecord(path: "/tmp/project/new.txt", name: "new.txt")]
+        )
+
+        let paths = try await store.loadAll().map(\.path).sorted()
+        XCTAssertEqual(paths, ["/tmp/project-sibling/keep.txt", "/tmp/project/new.txt"])
 
         try? FileManager.default.removeItem(at: directory)
     }

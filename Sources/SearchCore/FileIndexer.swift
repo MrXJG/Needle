@@ -32,6 +32,7 @@ public actor FileIndexer {
                 blockedPaths.append(rootURL.path)
                 continue
             }
+            blockedPaths.append(contentsOf: blockedProtectedHomeDescendants(under: rootURL))
 
             guard let enumerator = fileManager.enumerator(
                 at: rootURL,
@@ -68,10 +69,15 @@ public actor FileIndexer {
                     await progress?(processed)
                 }
             }
+
+            for protectedURL in protectedHomeDescendants(under: rootURL) {
+                let protectedRecords = scanSinglePath(protectedURL.path, settings: settings)
+                records.append(contentsOf: protectedRecords)
+            }
         }
 
         await progress?(processed)
-        return ScanResult(records: records, blockedPaths: blockedPaths)
+        return ScanResult(records: deduplicatedRecords(records), blockedPaths: Array(Set(blockedPaths)).sorted())
     }
 
     public func scanSinglePath(_ path: String, settings: IndexSettings) -> [FileRecord] {
@@ -115,5 +121,41 @@ public actor FileIndexer {
         }
 
         return records
+    }
+
+    private func blockedProtectedHomeDescendants(under rootURL: URL) -> [String] {
+        protectedHomeDescendants(under: rootURL).compactMap { url in
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+
+            do {
+                _ = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                return nil
+            } catch {
+                return url.path
+            }
+        }
+    }
+
+    private func protectedHomeDescendants(under rootURL: URL) -> [URL] {
+        let home = fileManager.homeDirectoryForCurrentUser
+        guard rootURL.path == home.path || home.path.hasPrefix(rootURL.path + "/") else {
+            return []
+        }
+
+        let protectedNames = ["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures"]
+        return protectedNames.map {
+            home.appendingPathComponent($0, isDirectory: true)
+        }
+    }
+
+    private func deduplicatedRecords(_ records: [FileRecord]) -> [FileRecord] {
+        var recordsByPath: [String: FileRecord] = [:]
+        recordsByPath.reserveCapacity(records.count)
+
+        for record in records {
+            recordsByPath[record.path] = record
+        }
+
+        return Array(recordsByPath.values)
     }
 }

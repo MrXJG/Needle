@@ -10,38 +10,90 @@ public struct SearchEngine: Sendable {
         preferredFolderPaths: [String] = []
     ) -> [FileRecord] {
         guard !records.isEmpty else { return [] }
+        guard limit > 0 else { return [] }
         guard query.invalidRegexPatterns.isEmpty else { return [] }
         let regexes = query.regexPatterns.compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
         guard regexes.count == query.regexPatterns.count else { return [] }
         let wildcardRegexes = query.wildcardPatterns.compactMap {
             try? NSRegularExpression(pattern: wildcardRegexPattern(from: $0), options: [.caseInsensitive])
         }
+        let preferredFolders = normalizedPreferredFolders(preferredFolderPaths)
 
-        let filtered = records.compactMap { record -> (FileRecord, Int)? in
-            guard matches(record, query: query, wildcardRegexes: wildcardRegexes, regexes: regexes) else {
-                return nil
+        var topMatches: [(record: FileRecord, score: Int)] = []
+        topMatches.reserveCapacity(min(limit, records.count))
+
+        for record in records {
+            if Task.isCancelled {
+                return []
             }
-            return (record, score(record, query: query, preferredFolderPaths: preferredFolderPaths))
+
+            guard matches(record, query: query, wildcardRegexes: wildcardRegexes, regexes: regexes) else {
+                continue
+            }
+
+            insertTopMatch(
+                (record, score(record, query: query, preferredFolders: preferredFolders)),
+                into: &topMatches,
+                limit: limit
+            )
         }
 
-        return filtered
-            .sorted { lhs, rhs in
-                if lhs.1 != rhs.1 {
-                    return lhs.1 > rhs.1
-                }
-                if lhs.0.openCount != rhs.0.openCount {
-                    return lhs.0.openCount > rhs.0.openCount
-                }
-                if lhs.0.lastOpenedAt != rhs.0.lastOpenedAt {
-                    return (lhs.0.lastOpenedAt ?? .distantPast) > (rhs.0.lastOpenedAt ?? .distantPast)
-                }
-                if lhs.0.modifiedAt != rhs.0.modifiedAt {
-                    return lhs.0.modifiedAt > rhs.0.modifiedAt
-                }
-                return lhs.0.path.localizedStandardCompare(rhs.0.path) == .orderedAscending
+        return topMatches.map(\.record)
+    }
+
+    private func insertTopMatch(
+        _ candidate: (record: FileRecord, score: Int),
+        into matches: inout [(record: FileRecord, score: Int)],
+        limit: Int
+    ) {
+        if matches.count == limit, let last = matches.last, !isHigherPriority(candidate, than: last) {
+            return
+        }
+
+        let insertionIndex = insertionIndex(for: candidate, in: matches)
+        matches.insert(candidate, at: insertionIndex)
+
+        if matches.count > limit {
+            matches.removeLast()
+        }
+    }
+
+    private func insertionIndex(
+        for candidate: (record: FileRecord, score: Int),
+        in matches: [(record: FileRecord, score: Int)]
+    ) -> Int {
+        var lowerBound = 0
+        var upperBound = matches.count
+
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if isHigherPriority(candidate, than: matches[middle]) {
+                upperBound = middle
+            } else {
+                lowerBound = middle + 1
             }
-            .prefix(limit)
-            .map(\.0)
+        }
+
+        return lowerBound
+    }
+
+    private func isHigherPriority(
+        _ lhs: (record: FileRecord, score: Int),
+        than rhs: (record: FileRecord, score: Int)
+    ) -> Bool {
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
+        if lhs.record.openCount != rhs.record.openCount {
+            return lhs.record.openCount > rhs.record.openCount
+        }
+        if lhs.record.lastOpenedAt != rhs.record.lastOpenedAt {
+            return (lhs.record.lastOpenedAt ?? .distantPast) > (rhs.record.lastOpenedAt ?? .distantPast)
+        }
+        if lhs.record.modifiedAt != rhs.record.modifiedAt {
+            return lhs.record.modifiedAt > rhs.record.modifiedAt
+        }
+        return lhs.record.path.localizedStandardCompare(rhs.record.path) == .orderedAscending
     }
 
     private func matches(
@@ -88,12 +140,12 @@ public struct SearchEngine: Sendable {
         }
     }
 
-    private func score(_ record: FileRecord, query: SearchQuery, preferredFolderPaths: [String]) -> Int {
+    private func score(_ record: FileRecord, query: SearchQuery, preferredFolders: [PreferredFolder]) -> Int {
         guard !query.terms.isEmpty else {
             return 1
                 + min(record.openCount * 5, 100)
                 + recentOpenBoost(for: record)
-                + preferredFolderBoost(for: record, preferredFolderPaths: preferredFolderPaths)
+                + preferredFolderBoost(for: record, preferredFolders: preferredFolders)
         }
 
         let name = record.name.lowercased()
@@ -117,10 +169,10 @@ public struct SearchEngine: Sendable {
             }
         }
 
-        score -= min(record.path.split(separator: "/").count * 2, 80)
+        score -= min(pathComponentCount(record.path) * 2, 80)
         score += min(record.openCount * 15, 180)
         score += recentOpenBoost(for: record)
-        score += preferredFolderBoost(for: record, preferredFolderPaths: preferredFolderPaths)
+        score += preferredFolderBoost(for: record, preferredFolders: preferredFolders)
         return score
     }
 
@@ -139,22 +191,40 @@ public struct SearchEngine: Sendable {
         return 15
     }
 
-    private func preferredFolderBoost(for record: FileRecord, preferredFolderPaths: [String]) -> Int {
-        let normalizedPaths = preferredFolderPaths
+    private func normalizedPreferredFolders(_ paths: [String]) -> [PreferredFolder] {
+        paths
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
             .filter { !$0.isEmpty }
+            .map { PreferredFolder(root: "/" + $0) }
+    }
 
-        guard !normalizedPaths.isEmpty else { return 0 }
-
+    private func preferredFolderBoost(for record: FileRecord, preferredFolders: [PreferredFolder]) -> Int {
+        guard !preferredFolders.isEmpty else { return 0 }
         var bestBoost = 0
-        for folderPath in normalizedPaths {
-            let root = "/" + folderPath
+        for folder in preferredFolders {
+            let root = folder.root
             guard record.path == root || record.path.hasPrefix(root + "/") else { continue }
             let relativePath = String(record.path.dropFirst(root.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let relativeDepth = relativePath.isEmpty ? 0 : relativePath.split(separator: "/").count
+            let relativeDepth = pathComponentCount(relativePath)
             bestBoost = max(bestBoost, max(20, 80 - min(relativeDepth * 10, 60)))
         }
         return bestBoost
+    }
+
+    private func pathComponentCount(_ path: String) -> Int {
+        guard !path.isEmpty else { return 0 }
+
+        var count = 0
+        var isInsideComponent = false
+        for character in path {
+            if character == "/" {
+                isInsideComponent = false
+            } else if !isInsideComponent {
+                count += 1
+                isInsideComponent = true
+            }
+        }
+        return count
     }
 
     private func wildcardRegexPattern(from wildcard: String) -> String {
@@ -167,5 +237,9 @@ public struct SearchEngine: Sendable {
     private func matchesRegex(_ regex: NSRegularExpression, in text: String) -> Bool {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    private struct PreferredFolder {
+        let root: String
     }
 }
