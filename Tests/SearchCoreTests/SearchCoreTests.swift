@@ -310,11 +310,7 @@ final class SearchCoreTests: XCTestCase {
         let settings = IndexSettings()
 
         XCTAssertEqual(settings.excludedNamePatterns, IndexSettings.commonExcludedNamePatterns)
-        XCTAssertTrue(settings.excludedNamePatterns.contains("node_modules"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains("DerivedData"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains("Library/Logs"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains(".codex"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains(".omx"))
+        XCTAssertEqual(settings.excludedNamePatterns, [".DS_Store"])
     }
 
     func testAppSettingsDecodeLegacyPayloadKeepsBackgroundDefaultEnabled() throws {
@@ -349,7 +345,7 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertTrue(settings.autoCheckUpdates)
     }
 
-    func testIndexSettingsMigrationAddsNewCommonExclusions() throws {
+    func testIndexSettingsMigrationKeepsLegacyExclusionsUnchanged() throws {
         let legacyPayload = """
         {
           "roots": ["/Users/me"],
@@ -364,9 +360,10 @@ final class SearchCoreTests: XCTestCase {
 
         let settings = AppPreferences(defaults: defaults).load()
 
-        XCTAssertTrue(settings.excludedNamePatterns.contains(".omx"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains(".codex"))
-        XCTAssertTrue(settings.excludedNamePatterns.contains("Library/Logs"))
+        XCTAssertEqual(
+            settings.excludedNamePatterns,
+            [".git", "node_modules", ".build", "Library/Caches", "DerivedData", ".swiftpm", ".DS_Store"]
+        )
     }
 
     func testIndexSettingsMigrationRestoresEmptyExclusionsAndPersistsThem() throws {
@@ -399,12 +396,12 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertTrue(settings.shouldIndex(path: "/tmp/project/Sources/App.swift", name: "App.swift"))
     }
 
-    func testSettingsExcludeOmxStateDirectories() {
+    func testSettingsDoesNotExcludeOmxStateDirectoriesByDefault() {
         let settings = IndexSettings()
 
-        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Desktop/.omx/logs/turns.jsonl", name: "turns.jsonl"))
-        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/.codex/logs_2.sqlite", name: "logs_2.sqlite"))
-        XCTAssertFalse(settings.shouldIndex(path: "/Users/me/Library/Logs/codex-plusplus-watcher.log", name: "codex-plusplus-watcher.log"))
+        XCTAssertTrue(settings.shouldIndex(path: "/Users/me/Desktop/.omx/logs/turns.jsonl", name: "turns.jsonl"))
+        XCTAssertTrue(settings.shouldIndex(path: "/Users/me/.codex/logs_2.sqlite", name: "logs_2.sqlite"))
+        XCTAssertTrue(settings.shouldIndex(path: "/Users/me/Library/Logs/codex-plusplus-watcher.log", name: "codex-plusplus-watcher.log"))
     }
 
     func testSettingsExcludeCustomPathFragments() {

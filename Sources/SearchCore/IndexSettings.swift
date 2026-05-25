@@ -2,18 +2,8 @@ import Foundation
 
 public struct IndexSettings: Codable, Equatable, Sendable {
     public static let commonExcludedNamePatterns = [
-        ".git",
-        "node_modules",
-        ".build",
-        "Library/Caches",
-        "Library/Logs",
-        "DerivedData",
-        ".codex",
-        ".omx",
-        ".swiftpm",
         ".DS_Store"
     ]
-    private static let migratedExcludedNamePatterns = ["Library/Logs", ".codex", ".omx"]
 
     public var roots: [String]
     public var excludedPaths: [String]
@@ -63,11 +53,6 @@ public struct IndexSettings: Codable, Equatable, Sendable {
     public mutating func migrateIfNeeded() {
         if excludedNamePatterns.isEmpty {
             excludedNamePatterns = Self.commonExcludedNamePatterns
-            return
-        }
-
-        for pattern in Self.migratedExcludedNamePatterns where !excludedNamePatterns.contains(pattern) {
-            excludedNamePatterns.append(pattern)
         }
     }
 }

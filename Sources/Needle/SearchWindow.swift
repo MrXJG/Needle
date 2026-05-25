@@ -5,6 +5,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SearchWindow: View {
+    private static let minimumWindowSize = NSSize(width: 980, height: 680)
+    private static let idealWindowSize = NSSize(width: 1160, height: 760)
     @Bindable var model: SearchAppModel
     let shortcutController: GlobalShortcutController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -38,7 +40,12 @@ struct SearchWindow: View {
             }
         }
         .animation(settingsAnimation, value: showSettings)
-        .frame(minWidth: 860, idealWidth: 980, minHeight: 560, idealHeight: 680)
+        .frame(
+            minWidth: Self.minimumWindowSize.width,
+            idealWidth: Self.idealWindowSize.width,
+            minHeight: Self.minimumWindowSize.height,
+            idealHeight: Self.idealWindowSize.height
+        )
         .background(.regularMaterial)
         .background {
             WindowAccessor { window in
@@ -46,6 +53,16 @@ struct SearchWindow: View {
                 window.title = "Needle"
                 window.identifier = NSUserInterfaceItemIdentifier("NeedleSearchWindow")
                 window.isMovableByWindowBackground = true
+                window.minSize = Self.minimumWindowSize
+
+                let shouldEnlargeWidth = window.frame.width < Self.idealWindowSize.width
+                let shouldEnlargeHeight = window.frame.height < Self.idealWindowSize.height
+                if shouldEnlargeWidth || shouldEnlargeHeight {
+                    var frame = window.frame
+                    frame.size.width = max(frame.size.width, Self.idealWindowSize.width)
+                    frame.size.height = max(frame.size.height, Self.idealWindowSize.height)
+                    window.setFrame(frame, display: true)
+                }
             }
         }
         .sheet(isPresented: $showPermissionGuide) {
@@ -210,6 +227,17 @@ private extension SearchWindow {
                 }
 
                 HStack(spacing: 6) {
+                    if let updateVersion = updateAvailableVersion {
+                        headerIconButton(
+                            systemName: "arrow.down.circle.fill",
+                            foregroundStyle: AnyShapeStyle(.blue)
+                        ) {
+                            model.openLatestReleasePage()
+                        }
+                        .help("发现新版本 \(updateVersion)，点击前往下载")
+                        .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    }
+
                     HelpTip(
                         title: "搜索语法",
                         steps: [
@@ -257,11 +285,15 @@ private extension SearchWindow {
         .padding(22)
     }
 
-    private func headerIconButton(systemName: String, action: @escaping () -> Void) -> some View {
+    private func headerIconButton(
+        systemName: String,
+        foregroundStyle: AnyShapeStyle = AnyShapeStyle(.secondary),
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(foregroundStyle)
                 .frame(width: 28, height: 28)
                 .contentShape(Rectangle())
         }
@@ -384,6 +416,11 @@ private extension SearchWindow {
                 showIndexCompleted = false
             }
         }
+    }
+
+    private var updateAvailableVersion: String? {
+        guard case .updateAvailable(let version, _) = model.updateCheckState else { return nil }
+        return version
     }
 }
 

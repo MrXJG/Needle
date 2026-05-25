@@ -825,7 +825,7 @@ private struct ExclusionEditor: View {
             }
 
             HStack(spacing: 8) {
-                TextField("例如 node_modules、.git、Library/Caches", text: $newPattern)
+                TextField("例如 Downloads、临时文件夹、cache", text: $newPattern)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(addPattern)
 
