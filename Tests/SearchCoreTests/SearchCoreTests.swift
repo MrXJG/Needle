@@ -333,6 +333,22 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertTrue(settings.keepRunningAfterWindowClose)
     }
 
+    func testAppSettingsDecodeLegacyPayloadKeepsAutoCheckUpdatesEnabledByDefault() throws {
+        let legacyPayload = """
+        {
+          "launchAtLogin": false,
+          "globalShortcutEnabled": true,
+          "globalShortcutKeyCode": 3,
+          "globalShortcutModifiers": 1179648,
+          "hasCompletedOnboarding": true
+        }
+        """.data(using: .utf8)!
+
+        let settings = try JSONDecoder().decode(AppSettings.self, from: legacyPayload)
+
+        XCTAssertTrue(settings.autoCheckUpdates)
+    }
+
     func testIndexSettingsMigrationAddsNewCommonExclusions() throws {
         let legacyPayload = """
         {
@@ -560,6 +576,17 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertTrue(SearchAppModel.isProtectedAppDataPath("\(home)/Library/Application Support/Quark/data.db"))
         XCTAssertTrue(SearchAppModel.isProtectedAppDataPath("\(home)/Library/Containers/com.apple.mail"))
         XCTAssertFalse(SearchAppModel.isProtectedAppDataPath("\(home)/Downloads/report.pdf"))
+    }
+
+    func testNormalizedVersionStringStripsLeadingV() {
+        XCTAssertEqual(SearchAppModel.normalizedVersionString("v0.2.4"), "0.2.4")
+        XCTAssertEqual(SearchAppModel.normalizedVersionString("0.2.4"), "0.2.4")
+    }
+
+    func testCompareVersionUsesSemanticSegments() {
+        XCTAssertEqual(SearchAppModel.compareVersion("v0.2.10", "0.2.9"), .orderedDescending)
+        XCTAssertEqual(SearchAppModel.compareVersion("0.2.3", "0.2.3"), .orderedSame)
+        XCTAssertEqual(SearchAppModel.compareVersion("0.2.2", "0.2.3"), .orderedAscending)
     }
 
     func testBackgroundEventBufferAggregatesEventsOffMainActor() {

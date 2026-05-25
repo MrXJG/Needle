@@ -188,6 +188,30 @@ struct SettingsView: View {
                 PreferenceDivider()
 
                 preferenceRow(
+                    icon: "arrow.down.circle",
+                    title: "自动检查更新",
+                    description: "启动后后台检查是否有新版本，只提示更新，不会自动下载安装。\n当前状态：\(updateStatusDescription)"
+                ) {
+                    HStack(spacing: 8) {
+                        Button(updateActionButtonTitle) {
+                            if case .updateAvailable = model.updateCheckState {
+                                model.openLatestReleasePage()
+                            } else {
+                                model.checkForUpdatesNow()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(model.updateCheckState == .checking)
+
+                        Toggle("", isOn: $model.appSettings.autoCheckUpdates)
+                            .labelsHidden()
+                    }
+                }
+
+                PreferenceDivider()
+
+                preferenceRow(
                     icon: "command",
                     title: "全局快捷键",
                     description: "使用 ⌘ ⇧ F 从任何地方打开 Needle。"
@@ -208,6 +232,46 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var updateStatusDescription: String {
+        let versionPrefix: String
+        if let latestKnownVersion = model.latestKnownVersion {
+            versionPrefix = "当前 \(model.currentAppVersion) / 最新 \(latestKnownVersion)"
+        } else {
+            versionPrefix = "当前 \(model.currentAppVersion) / 最新 -"
+        }
+
+        let checkedAtSuffix: String
+        if let checkedAt = model.lastUpdateCheckedAt {
+            checkedAtSuffix = "（上次检查：\(checkedAt.formatted(date: .omitted, time: .shortened))）"
+        } else {
+            checkedAtSuffix = "（尚未检查）"
+        }
+
+        switch model.updateCheckState {
+        case .idle:
+            return "\(versionPrefix)，尚未检查更新\(checkedAtSuffix)"
+        case .checking:
+            return "\(versionPrefix)，正在检查更新…"
+        case .upToDate:
+            return "\(versionPrefix)，当前已是最新版本\(checkedAtSuffix)"
+        case .updateAvailable(let version, _):
+            return "\(versionPrefix)，发现新版本 \(version)"
+        case .failed(let message):
+            return "\(versionPrefix)，\(message)\(checkedAtSuffix)"
+        }
+    }
+
+    private var updateActionButtonTitle: String {
+        switch model.updateCheckState {
+        case .updateAvailable:
+            return "查看新版本"
+        case .checking:
+            return "检查中…"
+        default:
+            return "立即检查"
         }
     }
 

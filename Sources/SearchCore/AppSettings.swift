@@ -13,6 +13,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var hasCompletedOnboarding: Bool
     public var keepRunningAfterWindowClose: Bool
     public var commandQHidesWindow: Bool
+    public var autoCheckUpdates: Bool
 
     public init(
         launchAtLogin: Bool = false,
@@ -21,7 +22,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         globalShortcutModifiers: UInt = Self.defaultGlobalShortcutModifiers,
         hasCompletedOnboarding: Bool = false,
         keepRunningAfterWindowClose: Bool = true,
-        commandQHidesWindow: Bool = false
+        commandQHidesWindow: Bool = false,
+        autoCheckUpdates: Bool = true
     ) {
         self.launchAtLogin = launchAtLogin
         self.globalShortcutEnabled = globalShortcutEnabled
@@ -30,6 +32,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.hasCompletedOnboarding = hasCompletedOnboarding
         self.keepRunningAfterWindowClose = keepRunningAfterWindowClose
         self.commandQHidesWindow = commandQHidesWindow
+        self.autoCheckUpdates = autoCheckUpdates
     }
 
     public mutating func migrateIfNeeded() {
@@ -48,6 +51,7 @@ public extension AppSettings {
         case hasCompletedOnboarding
         case keepRunningAfterWindowClose
         case commandQHidesWindow
+        case autoCheckUpdates
     }
 
     init(from decoder: Decoder) throws {
@@ -59,7 +63,8 @@ public extension AppSettings {
             globalShortcutModifiers: try container.decodeIfPresent(UInt.self, forKey: .globalShortcutModifiers) ?? Self.defaultGlobalShortcutModifiers,
             hasCompletedOnboarding: try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false,
             keepRunningAfterWindowClose: try container.decodeIfPresent(Bool.self, forKey: .keepRunningAfterWindowClose) ?? true,
-            commandQHidesWindow: try container.decodeIfPresent(Bool.self, forKey: .commandQHidesWindow) ?? false
+            commandQHidesWindow: try container.decodeIfPresent(Bool.self, forKey: .commandQHidesWindow) ?? false,
+            autoCheckUpdates: try container.decodeIfPresent(Bool.self, forKey: .autoCheckUpdates) ?? true
         )
     }
 }

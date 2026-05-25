@@ -6,6 +6,14 @@ import Observation
 @MainActor
 @Observable
 public final class SearchAppModel {
+    public enum UpdateCheckState: Equatable {
+        case idle
+        case checking
+        case upToDate
+        case updateAvailable(version: String, url: URL)
+        case failed(message: String)
+    }
+
     public private(set) var results: [FileRecord] = []
     public private(set) var indexedRecordCount = 0
     public private(set) var state: IndexerState = .idle
@@ -23,6 +31,10 @@ public final class SearchAppModel {
     public private(set) var lastRescanPathSample: [String] = []
     public private(set) var isSearching = false
     public private(set) var isMemoryIndexLoaded = false
+    public private(set) var updateCheckState: UpdateCheckState = .idle
+    public private(set) var lastUpdateCheckedAt: Date?
+    public private(set) var currentAppVersion: String
+    public private(set) var latestKnownVersion: String?
 
     public var queryText: String = "" {
         didSet { scheduleSearch(showActivity: true) }
@@ -42,6 +54,12 @@ public final class SearchAppModel {
     public var appSettings: AppSettings {
         didSet {
             preferences.save(appSettings)
+            if appSettings.autoCheckUpdates {
+                scheduleAutomaticUpdateCheckIfNeeded(forceDelay: true)
+            } else if updateCheckState == .checking {
+                updateCheckTask?.cancel()
+                updateCheckState = .idle
+            }
         }
     }
 
@@ -71,10 +89,12 @@ public final class SearchAppModel {
     private var searchTask: Task<Void, Never>?
     private var searchActivityTask: Task<Void, Never>?
     private var visibilityMonitorTask: Task<Void, Never>?
+    private var updateCheckTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var workspaceObservers: [NSObjectProtocol] = []
     private let pendingRescanPathLimit = 512
     private let fileManager = FileManager.default
+    private let updateCheckInterval: TimeInterval = 60 * 60 * 24
 
     public init(
         databaseURL: URL = SearchAppModel.defaultDatabaseURL(),
@@ -92,6 +112,7 @@ public final class SearchAppModel {
         self.settings = loadedSettings
         self.appSettings = loadedAppSettings
         self.matchPath = loadedSettings.matchPathByDefault
+        self.currentAppVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
         self.modelBox = modelBox
         self.backgroundEventBuffer = backgroundEventBuffer
         self.watcher = FSEventsWatcher { [weak modelBox, backgroundEventBuffer] update in
@@ -141,6 +162,7 @@ public final class SearchAppModel {
                     indexedSettings = settings
                     state = settings.roots.isEmpty ? .idle : .watching
                 }
+                scheduleAutomaticUpdateCheckIfNeeded()
             } else {
                 indexedSettings = settings
                 state = .idle
@@ -305,6 +327,7 @@ public final class SearchAppModel {
         Task { [weak self] in
             await self?.resumeIndexingAfterOnboarding()
         }
+        scheduleAutomaticUpdateCheckIfNeeded(forceDelay: true)
     }
 
     public func refreshPermissionStatus() {
@@ -312,6 +335,18 @@ public final class SearchAppModel {
         permissionStatus = PermissionStatusProvider.current()
         guard previous != permissionStatus else { return }
         handlePermissionStatusChanged(previous: previous, current: permissionStatus)
+    }
+
+    public func checkForUpdatesNow() {
+        updateCheckTask?.cancel()
+        updateCheckTask = Task { [weak self] in
+            await self?.checkForUpdates()
+        }
+    }
+
+    public func openLatestReleasePage() {
+        guard case .updateAvailable(_, let url) = updateCheckState else { return }
+        NSWorkspace.shared.open(url)
     }
 
     public func enterBackground() {
@@ -667,6 +702,94 @@ public final class SearchAppModel {
 
     private func refreshMissingIndexedRoots() {
         missingIndexedRoots = settings.roots.filter { !FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private func scheduleAutomaticUpdateCheckIfNeeded(forceDelay: Bool = false) {
+        guard appSettings.autoCheckUpdates, appSettings.hasCompletedOnboarding else { return }
+        guard forceDelay || shouldCheckUpdatesNow else { return }
+        updateCheckTask?.cancel()
+        updateCheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            await self?.checkForUpdates()
+        }
+    }
+
+    private var shouldCheckUpdatesNow: Bool {
+        guard let lastUpdateCheckedAt else { return true }
+        return Date().timeIntervalSince(lastUpdateCheckedAt) >= updateCheckInterval
+    }
+
+    private func checkForUpdates() async {
+        updateCheckState = .checking
+        do {
+            let latest = try await fetchLatestRelease()
+            applyLatestReleaseVersion(latestVersion: latest.version, releaseURL: latest.url)
+            lastUpdateCheckedAt = Date()
+        } catch {
+            updateCheckState = .failed(message: "检查更新失败，请稍后重试")
+            lastUpdateCheckedAt = Date()
+        }
+    }
+
+    private func fetchLatestRelease() async throws -> (version: String, url: URL) {
+        let requestURL = URL(string: "https://api.github.com/repos/MrXJG/Needle/releases/latest")!
+        var request = URLRequest(url: requestURL)
+        request.timeoutInterval = 12
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Needle/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw UpdateFetchError.invalidResponse
+            }
+
+            if (200...299).contains(http.statusCode) {
+                let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+                if release.draft {
+                    return ("0.0.0", URL(string: release.htmlURL) ?? URL(string: "https://github.com/MrXJG/Needle/releases")!)
+                }
+                let url = URL(string: release.htmlURL) ?? URL(string: "https://github.com/MrXJG/Needle/releases")!
+                return (Self.normalizedVersionString(release.tagName), url)
+            }
+
+            if http.statusCode == 403 {
+                return try await fetchLatestReleaseFromRedirect()
+            }
+
+            throw UpdateFetchError.httpStatus(http.statusCode)
+        } catch {
+            return try await fetchLatestReleaseFromRedirect()
+        }
+    }
+
+    private func fetchLatestReleaseFromRedirect() async throws -> (version: String, url: URL) {
+        let latestReleaseURL = URL(string: "https://github.com/MrXJG/Needle/releases/latest")!
+        var request = URLRequest(url: latestReleaseURL)
+        request.timeoutInterval = 12
+        request.setValue("Needle/1.0", forHTTPHeaderField: "User-Agent")
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let finalURL = response.url else {
+            throw UpdateFetchError.invalidResponse
+        }
+
+        let tag = finalURL.lastPathComponent
+        let normalized = Self.normalizedVersionString(tag)
+        guard normalized != tag || tag.hasPrefix("v") else {
+            throw UpdateFetchError.invalidVersion
+        }
+        return (normalized, finalURL)
+    }
+
+    private func applyLatestReleaseVersion(latestVersion: String, releaseURL: URL) {
+        latestKnownVersion = latestVersion
+        let isNewer = Self.compareVersion(latestVersion, currentAppVersion) == .orderedDescending
+        if isNewer {
+            updateCheckState = .updateAvailable(version: latestVersion, url: releaseURL)
+        } else {
+            updateCheckState = .upToDate
+        }
     }
 
     private func resumeIndexingAfterOnboarding() async {
@@ -1260,6 +1383,27 @@ public final class SearchAppModel {
         return false
     }
 
+    nonisolated static func normalizedVersionString(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.hasPrefix("v") {
+            return String(trimmed.dropFirst())
+        }
+        return trimmed
+    }
+
+    nonisolated static func compareVersion(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let lhsParts = normalizedVersionString(lhs).split(separator: ".").map { Int($0) ?? 0 }
+        let rhsParts = normalizedVersionString(rhs).split(separator: ".").map { Int($0) ?? 0 }
+        let maxCount = max(lhsParts.count, rhsParts.count)
+        for index in 0..<maxCount {
+            let l = index < lhsParts.count ? lhsParts[index] : 0
+            let r = index < rhsParts.count ? rhsParts[index] : 0
+            if l > r { return .orderedDescending }
+            if l < r { return .orderedAscending }
+        }
+        return .orderedSame
+    }
+
     private func writeLastRescanSnapshot(paths: [String]) {
         let directory = diagnosticsDirectoryURL
         let url = directory.appendingPathComponent("LastRescan.txt")
@@ -1355,6 +1499,24 @@ final class BackgroundEventBuffer: @unchecked Sendable {
             return FSEventsUpdate(paths: Array(paths), requiresFullRescan: false, reason: nil)
         }
     }
+}
+
+private struct GitHubRelease: Decodable {
+    let tagName: String
+    let htmlURL: String
+    let draft: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlURL = "html_url"
+        case draft
+    }
+}
+
+private enum UpdateFetchError: Error {
+    case invalidResponse
+    case httpStatus(Int)
+    case invalidVersion
 }
 
 public extension Notification.Name {

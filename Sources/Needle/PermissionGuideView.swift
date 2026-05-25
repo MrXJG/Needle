@@ -55,6 +55,18 @@ struct PermissionGuideView: View {
                 model.openAccessibilitySettings()
             }
 
+            permissionRow(
+                icon: "arrow.down.circle",
+                title: "自动检查更新",
+                description: "Needle 会在后台检查新版本，只提示更新，不会自动下载。",
+                isComplete: model.appSettings.autoCheckUpdates,
+                completeText: "已开启",
+                incompleteText: "未开启",
+                buttonTitle: model.appSettings.autoCheckUpdates ? "关闭" : "开启"
+            ) {
+                model.appSettings.autoCheckUpdates.toggle()
+            }
+
             HStack {
                 Spacer()
                 Button("稍后再说") {
