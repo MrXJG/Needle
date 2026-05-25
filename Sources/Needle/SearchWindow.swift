@@ -8,6 +8,7 @@ struct SearchWindow: View {
     @Bindable var model: SearchAppModel
     let shortcutController: GlobalShortcutController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @FocusState private var isSearchFieldFocused: Bool
     @State private var selection: FileRecord.ID?
     @State private var showSettings = false
     @State private var showFilters = false
@@ -182,14 +183,31 @@ private extension SearchWindow {
                     .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(.secondary)
 
-                TextField("搜索文件、文件夹或路径", text: $model.queryText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 28, weight: .semibold, design: .rounded))
-                    .onSubmit {
-                        if let selectedRecord {
-                            model.open(selectedRecord)
+                HStack(spacing: 8) {
+                    TextField("搜索文件、文件夹或路径", text: $model.queryText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 28, weight: .semibold, design: .rounded))
+                        .focused($isSearchFieldFocused)
+                        .onSubmit {
+                            if let selectedRecord {
+                                model.open(selectedRecord)
+                            }
                         }
+
+                    if !model.queryText.isEmpty {
+                        Button {
+                            model.queryText = ""
+                            isSearchFieldFocused = true
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("清空搜索")
+                        .accessibilityLabel("清空搜索")
                     }
+                }
 
                 HStack(spacing: 6) {
                     HelpTip(
