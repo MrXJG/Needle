@@ -93,6 +93,16 @@ final class GlobalShortcutController {
         }
     }
 
+    func hideSearchWindowToBackground() {
+        if let window {
+            window.orderOut(nil)
+        } else {
+            NSApp.windows.first?.orderOut(nil)
+        }
+        onWindowHidden?()
+        Self.hideDockIcon()
+    }
+
     private static func showDockIcon() {
         NSApp.setActivationPolicy(.regular)
     }

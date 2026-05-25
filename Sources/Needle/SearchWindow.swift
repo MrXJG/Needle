@@ -76,11 +76,15 @@ struct SearchWindow: View {
                     await model.enterForeground()
                 }
             }
-            model.refreshPermissionStatus()
+            if model.appSettings.hasCompletedOnboarding {
+                model.refreshPermissionStatus()
+            }
             showPermissionGuide = !model.appSettings.hasCompletedOnboarding
         }
         .onAppActivate {
-            model.refreshPermissionStatus()
+            if model.appSettings.hasCompletedOnboarding {
+                model.refreshPermissionStatus()
+            }
         }
         .onExitCommand {
             if showSettings {

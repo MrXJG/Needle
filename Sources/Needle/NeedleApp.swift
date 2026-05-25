@@ -14,6 +14,12 @@ struct NeedleApp: App {
                     NeedleAppDelegate.reopenHandler = {
                         shortcutController.showSearchWindow()
                     }
+                    NeedleAppDelegate.appSettingsProvider = {
+                        model.appSettings
+                    }
+                    NeedleAppDelegate.hideToBackgroundHandler = {
+                        shortcutController.hideSearchWindowToBackground()
+                    }
                     model.appSettings.launchAtLogin = LoginItemController.isEnabled
                     await model.start()
                     shortcutController.update(settings: model.appSettings)
@@ -60,7 +66,7 @@ struct NeedleApp: App {
             Divider()
 
             Button("退出") {
-                NSApplication.shared.terminate(nil)
+                NeedleAppDelegate.terminateNow()
             }
         }
     }

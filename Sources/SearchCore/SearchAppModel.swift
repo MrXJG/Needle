@@ -74,6 +74,7 @@ public final class SearchAppModel {
     private var searchGeneration = 0
     private var workspaceObservers: [NSObjectProtocol] = []
     private let pendingRescanPathLimit = 512
+    private let fileManager = FileManager.default
 
     public init(
         databaseURL: URL = SearchAppModel.defaultDatabaseURL(),
@@ -115,7 +116,9 @@ public final class SearchAppModel {
     }
 
     public func start() async {
-        refreshPermissionStatus()
+        if appSettings.hasCompletedOnboarding {
+            refreshPermissionStatus()
+        }
         installWorkspaceObservers()
         refreshMissingIndexedRoots()
         state = .loading
@@ -126,16 +129,21 @@ public final class SearchAppModel {
             if scopedRecords.count != loadedRecords.count {
                 try await store.replaceAll(with: scopedRecords)
             }
-            recordsStorage = scopedRecords
+            recordsStorage = filterPermissionRestrictedRecords(from: scopedRecords)
             isMemoryIndexLoaded = true
             indexedRecordCount = recordsStorage.count
             refreshResults()
-            startWatching()
-            if recordsStorage.isEmpty && !settings.roots.isEmpty {
-                await rebuildIndex()
+            if appSettings.hasCompletedOnboarding {
+                startWatching()
+                if recordsStorage.isEmpty && !settings.roots.isEmpty {
+                    await rebuildIndex()
+                } else {
+                    indexedSettings = settings
+                    state = settings.roots.isEmpty ? .idle : .watching
+                }
             } else {
                 indexedSettings = settings
-                state = settings.roots.isEmpty ? .idle : .watching
+                state = .idle
             }
         } catch {
             lastError = error.localizedDescription
@@ -172,7 +180,7 @@ public final class SearchAppModel {
 
         do {
             try await store.replaceAll(with: filteredRecords)
-            recordsStorage = filteredRecords
+            recordsStorage = filterPermissionRestrictedRecords(from: filteredRecords)
             isMemoryIndexLoaded = true
             indexedRecordCount = filteredRecords.count
             blockedPaths = result.blockedPaths
@@ -293,10 +301,17 @@ public final class SearchAppModel {
 
     public func completeOnboarding() {
         appSettings.hasCompletedOnboarding = true
+        refreshPermissionStatus()
+        Task { [weak self] in
+            await self?.resumeIndexingAfterOnboarding()
+        }
     }
 
     public func refreshPermissionStatus() {
+        let previous = permissionStatus
         permissionStatus = PermissionStatusProvider.current()
+        guard previous != permissionStatus else { return }
+        handlePermissionStatusChanged(previous: previous, current: permissionStatus)
     }
 
     public func enterBackground() {
@@ -344,6 +359,7 @@ public final class SearchAppModel {
             }
 
             recordsStorage = try await store.loadAll()
+            recordsStorage = filterPermissionRestrictedRecords(from: recordsStorage)
             indexedRecordCount = recordsStorage.count
             isMemoryIndexLoaded = true
             indexedSettings = settings
@@ -407,7 +423,7 @@ public final class SearchAppModel {
         }.value
 
         guard searchGeneration == generation else { return }
-        results = newResults
+        applyVisibleResultsAndQueueSelfHeal(newResults)
         lastSearchDurationMS = elapsedMilliseconds(since: startedAt)
         stopSearchActivity()
     }
@@ -457,7 +473,7 @@ public final class SearchAppModel {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.searchGeneration == generation else { return }
-                self.results = results.0
+                self.applyVisibleResultsAndQueueSelfHeal(results.0)
                 self.lastSearchDurationMS = results.1
                 self.stopSearchActivity()
             }
@@ -483,6 +499,33 @@ public final class SearchAppModel {
         searchActivityTask?.cancel()
         searchActivityTask = nil
         isSearching = false
+    }
+
+    private func applyVisibleResultsAndQueueSelfHeal(_ candidates: [FileRecord]) {
+        guard !candidates.isEmpty else {
+            results = []
+            return
+        }
+
+        var visible: [FileRecord] = []
+        visible.reserveCapacity(candidates.count)
+        var missingPaths = Set<String>()
+
+        for record in candidates {
+            if fileManager.fileExists(atPath: record.path) {
+                visible.append(record)
+            } else {
+                missingPaths.insert(record.path)
+            }
+        }
+
+        results = visible
+        guard !missingPaths.isEmpty else { return }
+
+        recordsStorage.removeAll { missingPaths.contains($0.path) }
+        indexedRecordCount = recordsStorage.count
+        pendingRescanPaths.formUnion(missingPaths)
+        schedulePendingRescanTask()
     }
 
     private func noteRecordOpened(path: String, at date: Date = Date()) {
@@ -624,6 +667,23 @@ public final class SearchAppModel {
 
     private func refreshMissingIndexedRoots() {
         missingIndexedRoots = settings.roots.filter { !FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private func resumeIndexingAfterOnboarding() async {
+        guard appSettings.hasCompletedOnboarding else { return }
+        refreshMissingIndexedRoots()
+        if settings.roots.isEmpty {
+            state = .idle
+            return
+        }
+
+        startWatching()
+        if recordsStorage.isEmpty {
+            await rebuildIndex()
+        } else {
+            indexedSettings = settings
+            state = .watching
+        }
     }
 
     private func handleFSEvents(_ update: FSEventsUpdate) {
@@ -791,6 +851,7 @@ public final class SearchAppModel {
             return
         }
         let newRecords = Self.deduplicatedRecords(filterInternalRecords(from: scannedRecords))
+        let visibleNewRecords = filterPermissionRestrictedRecords(from: newRecords)
 
         do {
             try await store.replaceSubtrees(paths: uniquePaths, with: newRecords)
@@ -802,7 +863,7 @@ public final class SearchAppModel {
             }
             let currentRecords = recordsStorage
             let mergeJob = Task.detached(priority: .utility) {
-                Self.recordsByApplyingRescan(currentRecords, newRecords: newRecords, replacing: uniquePaths)
+                Self.recordsByApplyingRescan(currentRecords, newRecords: visibleNewRecords, replacing: uniquePaths)
             }
             let mergedRecords = await withTaskCancellationHandler {
                 await mergeJob.value
@@ -1142,6 +1203,61 @@ public final class SearchAppModel {
         records.filter { record in
             settings.shouldIndex(path: record.path, name: record.name)
         }
+    }
+
+    private func filterPermissionRestrictedRecords(from records: [FileRecord]) -> [FileRecord] {
+        guard !permissionStatus.fullDiskAccessGranted else { return records }
+        return records.filter { record in
+            !Self.isProtectedAppDataPath(record.path)
+        }
+    }
+
+    private func handlePermissionStatusChanged(previous: PermissionStatus, current: PermissionStatus) {
+        if !current.fullDiskAccessGranted {
+            recordsStorage = filterPermissionRestrictedRecords(from: recordsStorage)
+            indexedRecordCount = recordsStorage.count
+            refreshResults(showActivity: false)
+            return
+        }
+
+        guard !previous.fullDiskAccessGranted, isMemoryIndexLoaded else { return }
+        Task { [weak self] in
+            await self?.reloadMemoryIndexForPermissionUpgrade()
+        }
+    }
+
+    private func reloadMemoryIndexForPermissionUpgrade() async {
+        do {
+            let loadedRecords = try await store.loadAll()
+            let scopedRecords = filterIndexSettingsRecords(from: loadedRecords)
+            recordsStorage = filterPermissionRestrictedRecords(from: scopedRecords)
+            indexedRecordCount = recordsStorage.count
+            refreshResults(showActivity: false)
+        } catch {
+            lastError = error.localizedDescription
+            state = .degraded(error.localizedDescription)
+        }
+    }
+
+    nonisolated static func isProtectedAppDataPath(_ path: String) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let protectedRoots = [
+            "\(home)/Library/Application Support",
+            "\(home)/Library/Group Containers",
+            "\(home)/Library/Containers",
+            "\(home)/Library/Mail",
+            "\(home)/Library/Messages",
+            "\(home)/Library/Safari",
+            "\(home)/Library/Keychains"
+        ]
+
+        for root in protectedRoots {
+            if normalized == root || normalized.hasPrefix(root + "/") {
+                return true
+            }
+        }
+        return false
     }
 
     private func writeLastRescanSnapshot(paths: [String]) {

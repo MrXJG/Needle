@@ -12,6 +12,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var globalShortcutModifiers: UInt
     public var hasCompletedOnboarding: Bool
     public var keepRunningAfterWindowClose: Bool
+    public var commandQHidesWindow: Bool
 
     public init(
         launchAtLogin: Bool = false,
@@ -19,7 +20,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         globalShortcutKeyCode: UInt16 = Self.defaultGlobalShortcutKeyCode,
         globalShortcutModifiers: UInt = Self.defaultGlobalShortcutModifiers,
         hasCompletedOnboarding: Bool = false,
-        keepRunningAfterWindowClose: Bool = true
+        keepRunningAfterWindowClose: Bool = true,
+        commandQHidesWindow: Bool = false
     ) {
         self.launchAtLogin = launchAtLogin
         self.globalShortcutEnabled = globalShortcutEnabled
@@ -27,6 +29,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.globalShortcutModifiers = globalShortcutModifiers
         self.hasCompletedOnboarding = hasCompletedOnboarding
         self.keepRunningAfterWindowClose = keepRunningAfterWindowClose
+        self.commandQHidesWindow = commandQHidesWindow
     }
 
     public mutating func migrateIfNeeded() {
@@ -44,6 +47,7 @@ public extension AppSettings {
         case globalShortcutModifiers
         case hasCompletedOnboarding
         case keepRunningAfterWindowClose
+        case commandQHidesWindow
     }
 
     init(from decoder: Decoder) throws {
@@ -54,7 +58,8 @@ public extension AppSettings {
             globalShortcutKeyCode: try container.decodeIfPresent(UInt16.self, forKey: .globalShortcutKeyCode) ?? Self.defaultGlobalShortcutKeyCode,
             globalShortcutModifiers: try container.decodeIfPresent(UInt.self, forKey: .globalShortcutModifiers) ?? Self.defaultGlobalShortcutModifiers,
             hasCompletedOnboarding: try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false,
-            keepRunningAfterWindowClose: try container.decodeIfPresent(Bool.self, forKey: .keepRunningAfterWindowClose) ?? true
+            keepRunningAfterWindowClose: try container.decodeIfPresent(Bool.self, forKey: .keepRunningAfterWindowClose) ?? true,
+            commandQHidesWindow: try container.decodeIfPresent(Bool.self, forKey: .commandQHidesWindow) ?? false
         )
     }
 }

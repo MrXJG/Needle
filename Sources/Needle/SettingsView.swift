@@ -177,6 +177,17 @@ struct SettingsView: View {
                 PreferenceDivider()
 
                 preferenceRow(
+                    icon: "keyboard.chevron.compact.down",
+                    title: "⌘Q 关闭窗口并保留快捷键",
+                    description: "开启后，按 ⌘Q 只会关闭搜索窗口，Needle 继续在后台保持全局快捷键可用。"
+                ) {
+                    Toggle("", isOn: $model.appSettings.commandQHidesWindow)
+                        .labelsHidden()
+                }
+
+                PreferenceDivider()
+
+                preferenceRow(
                     icon: "command",
                     title: "全局快捷键",
                     description: "使用 ⌘ ⇧ F 从任何地方打开 Needle。"
@@ -336,7 +347,7 @@ struct SettingsView: View {
             Spacer()
 
             Button("退出 Needle", role: .destructive) {
-                NSApplication.shared.terminate(nil)
+                NeedleAppDelegate.terminateNow()
             }
             .buttonStyle(.bordered)
 

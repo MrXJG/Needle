@@ -250,6 +250,33 @@ final class SearchCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testSearchFiltersOutDeletedFileBeforeRescanCompletes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("中国高等教育学位在线验证报告.pdf")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "中国高等教育学位在线验证报告"
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try FileManager.default.removeItem(at: fileURL)
+        model.queryText = "中国高等教育学位在线验证报告"
+        try await Task.sleep(for: .milliseconds(350))
+
+        XCTAssertTrue(model.results.isEmpty)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
     func testStartPrunesSQLiteRecordsExcludedByCurrentSettings() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let databaseURL = directory.appendingPathComponent("index.sqlite")
@@ -525,6 +552,14 @@ final class SearchCoreTests: XCTestCase {
         )
 
         XCTAssertEqual(prepared, ["/Users/me/Downloads/PlayCover.dmg"])
+    }
+
+    func testProtectedAppDataPathDetection() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        XCTAssertTrue(SearchAppModel.isProtectedAppDataPath("\(home)/Library/Application Support/Quark/data.db"))
+        XCTAssertTrue(SearchAppModel.isProtectedAppDataPath("\(home)/Library/Containers/com.apple.mail"))
+        XCTAssertFalse(SearchAppModel.isProtectedAppDataPath("\(home)/Downloads/report.pdf"))
     }
 
     func testBackgroundEventBufferAggregatesEventsOffMainActor() {
