@@ -45,6 +45,7 @@ public actor SQLiteStore {
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY NOT NULL,
             name TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
             parent_path TEXT NOT NULL,
             kind TEXT NOT NULL,
             ext TEXT NOT NULL,
@@ -56,7 +57,9 @@ public actor SQLiteStore {
         );
         """)
         try execute("ALTER TABLE files ADD COLUMN last_opened_at REAL;", ignoringMessageContaining: "duplicate column name")
+        try execute("ALTER TABLE files ADD COLUMN display_name TEXT NOT NULL DEFAULT '';", ignoringMessageContaining: "duplicate column name")
         try execute("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_files_display_name ON files(display_name);")
         try execute("CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);")
     }
 
@@ -89,11 +92,12 @@ public actor SQLiteStore {
         guard !records.isEmpty else { return }
         let sql = """
         INSERT INTO files
-            (path, name, parent_path, kind, ext, size, modified_at, volume_identifier, open_count, last_opened_at)
+            (path, name, display_name, parent_path, kind, ext, size, modified_at, volume_identifier, open_count, last_opened_at)
         VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
+            display_name = excluded.display_name,
             parent_path = excluded.parent_path,
             kind = excluded.kind,
             ext = excluded.ext,
@@ -165,7 +169,7 @@ public actor SQLiteStore {
 
     public func loadAll() throws -> [FileRecord] {
         let sql = """
-        SELECT path, name, kind, ext, size, modified_at, open_count, last_opened_at
+        SELECT path, name, display_name, kind, ext, size, modified_at, open_count, last_opened_at
         FROM files;
         """
         return try loadRecords(sql: sql)
@@ -174,7 +178,7 @@ public actor SQLiteStore {
     public func loadPreview(limit: Int) throws -> [FileRecord] {
         guard limit > 0 else { return [] }
         let sql = """
-        SELECT path, name, kind, ext, size, modified_at, open_count, last_opened_at
+        SELECT path, name, display_name, kind, ext, size, modified_at, open_count, last_opened_at
         FROM files
         LIMIT \(limit);
         """
@@ -241,31 +245,42 @@ public actor SQLiteStore {
     private func bind(_ record: FileRecord, to statement: OpaquePointer?) {
         sqlite3_bind_text(statement, 1, record.path, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 2, record.name, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(statement, 3, record.parentPath, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(statement, 4, record.kind.rawValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(statement, 5, record.ext, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int64(statement, 6, record.size)
-        sqlite3_bind_double(statement, 7, record.modifiedAt.timeIntervalSince1970)
-        sqlite3_bind_text(statement, 8, "", -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(statement, 9, Int32(record.openCount))
+        sqlite3_bind_text(statement, 3, record.displayName, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 4, record.parentPath, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 5, record.kind.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 6, record.ext, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 7, record.size)
+        sqlite3_bind_double(statement, 8, record.modifiedAt.timeIntervalSince1970)
+        sqlite3_bind_text(statement, 9, "", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(statement, 10, Int32(record.openCount))
         if let lastOpenedAt = record.lastOpenedAt {
-            sqlite3_bind_double(statement, 10, lastOpenedAt.timeIntervalSince1970)
+            sqlite3_bind_double(statement, 11, lastOpenedAt.timeIntervalSince1970)
         } else {
-            sqlite3_bind_null(statement, 10)
+            sqlite3_bind_null(statement, 11)
         }
     }
 
     private func readRecord(from statement: OpaquePointer?) -> FileRecord {
-        FileRecord(
-            path: text(statement, 0),
-            name: text(statement, 1),
+        let path = text(statement, 0)
+        let name = text(statement, 1)
+        let storedDisplayName = text(statement, 2)
+        let kind = FileKind(rawValue: text(statement, 3)) ?? .other
+        let ext = text(statement, 4)
+        let displayName = storedDisplayName.isEmpty
+            ? FileRecord.localizedDisplayName(forPath: path, kind: kind, ext: ext)
+            : storedDisplayName
+
+        return FileRecord(
+            path: path,
+            name: name,
             parentPath: "",
-            kind: FileKind(rawValue: text(statement, 2)) ?? .other,
-            ext: text(statement, 3),
-            size: sqlite3_column_int64(statement, 4),
-            modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 5)),
-            openCount: Int(sqlite3_column_int(statement, 6)),
-            lastOpenedAt: optionalDate(statement, 7)
+            displayName: displayName,
+            kind: kind,
+            ext: ext,
+            size: sqlite3_column_int64(statement, 5),
+            modifiedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
+            openCount: Int(sqlite3_column_int(statement, 7)),
+            lastOpenedAt: optionalDate(statement, 8)
         )
     }
 

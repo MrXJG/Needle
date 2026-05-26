@@ -137,21 +137,26 @@ public struct SearchEngine: Sendable {
         }
 
         let name = record.name.lowercased()
+        let displayName = record.displayName.lowercased()
         let path = query.matchPath ? record.path.lowercased() : ""
         guard query.terms.allSatisfy({ term in
-            name.contains(term) || (query.matchPath && path.contains(term))
+            name.contains(term) || displayName.contains(term) || (query.matchPath && path.contains(term))
         }) else {
             return false
         }
 
         guard wildcardRegexes.allSatisfy({ regex in
-            matchesRegex(regex, in: name) || (query.matchPath && matchesRegex(regex, in: path))
+            matchesRegex(regex, in: name)
+                || matchesRegex(regex, in: displayName)
+                || (query.matchPath && matchesRegex(regex, in: path))
         }) else {
             return false
         }
 
         return regexes.allSatisfy { regex in
-            matchesRegex(regex, in: name) || (query.matchPath && matchesRegex(regex, in: path))
+            matchesRegex(regex, in: name)
+                || matchesRegex(regex, in: displayName)
+                || (query.matchPath && matchesRegex(regex, in: path))
         }
     }
 
@@ -176,20 +181,32 @@ public struct SearchEngine: Sendable {
 
         let name = record.name.lowercased()
         let path = query.matchPath ? record.path.lowercased() : ""
+        let displayName = record.displayName.lowercased()
         let stem = lowercasedStem(from: record.name)
+        let displayStem = lowercasedStem(from: record.displayName)
         var score = 0
 
         for term in query.terms {
             if name == term {
                 score += 1600
+            } else if displayName == term {
+                score += 1550
             } else if stem == term {
                 score += 1350
+            } else if displayStem == term {
+                score += 1325
             } else if stem.hasPrefix(term) {
                 score += 1050
+            } else if displayStem.hasPrefix(term) {
+                score += 1025
             } else if name.hasPrefix(term) {
                 score += 900
+            } else if displayName.hasPrefix(term) {
+                score += 875
             } else if name.contains(term) {
                 score += 650
+            } else if displayName.contains(term) {
+                score += 625
             } else if query.matchPath && path.contains(term) {
                 score += 250
             }

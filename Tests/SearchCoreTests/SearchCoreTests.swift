@@ -131,10 +131,42 @@ final class SearchCoreTests: XCTestCase {
     }
 
     func testAppBundlesKeepFolderKindButExposeApplicationBundleSemantics() {
-        let record = makeRecord(path: "/Applications/Needle.app", name: "Needle.app", kind: .folder, ext: "app")
+        let record = makeRecord(
+            path: "/Applications/WeChat.app",
+            name: "WeChat.app",
+            displayName: "微信.app",
+            kind: .folder,
+            ext: "app"
+        )
 
         XCTAssertEqual(record.kind, .folder)
         XCTAssertTrue(record.isApplicationBundle)
+        XCTAssertEqual(record.displayLabel, "微信.app")
+
+        let engine = SearchEngine()
+        let results = engine.search([record], query: .parse("微信.app"))
+        XCTAssertEqual(results.map(\.path), ["/Applications/WeChat.app"])
+    }
+
+    func testFileRecordDecodeLegacyPayloadDefaultsDisplayName() throws {
+        let payload = """
+        {
+          "path": "/Applications/WeChat.app",
+          "name": "WeChat.app",
+          "kind": "folder",
+          "ext": "app",
+          "size": 100,
+          "modifiedAt": 1700000000,
+          "openCount": 0
+        }
+        """.data(using: .utf8)!
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let record = try decoder.decode(FileRecord.self, from: payload)
+
+        XCTAssertEqual(record.displayName, "")
+        XCTAssertEqual(record.displayLabel, "WeChat.app")
     }
 
     func testFiltersByWildcardAndRegex() {
@@ -909,13 +941,14 @@ final class SearchCoreTests: XCTestCase {
         try await store.open()
 
         try await store.upsert([
-            makeRecord(path: "/tmp/Readme.md", name: "Readme.md", ext: "md")
+            makeRecord(path: "/tmp/Readme.md", name: "Readme.md", displayName: "说明.md", ext: "md")
         ])
         let openedAt = Date(timeIntervalSince1970: 1_750_000_000)
         try await store.recordOpen(path: "/tmp/Readme.md", at: openedAt)
 
         let records = try await store.loadAll()
         XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.displayName, "说明.md")
         XCTAssertEqual(records.first?.openCount, 1)
         XCTAssertEqual(records.first?.lastOpenedAt, openedAt)
 
@@ -1119,6 +1152,7 @@ final class SearchCoreTests: XCTestCase {
 private func makeRecord(
     path: String,
     name: String,
+    displayName: String = "",
     kind: FileKind = .file,
     ext: String = "txt",
     openCount: Int = 0,
@@ -1128,6 +1162,7 @@ private func makeRecord(
         path: path,
         name: name,
         parentPath: URL(fileURLWithPath: path).deletingLastPathComponent().path,
+        displayName: displayName,
         kind: kind,
         ext: ext,
         size: 100,

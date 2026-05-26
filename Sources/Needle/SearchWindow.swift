@@ -828,7 +828,7 @@ struct ResultsList: View, @preconcurrency Equatable {
                 HStack(spacing: 8) {
                     FileIconView(record: record, mode: .list, size: 18)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(record.name)
+                        Text(record.displayLabel)
                             .fontWeight(.medium)
                         Text(record.parentPath)
                             .font(.caption)
@@ -912,7 +912,7 @@ struct ResultsList: View, @preconcurrency Equatable {
 
 private extension FileRecord {
     var needleSortName: String {
-        name
+        displayLabel
     }
 
     var needleSortKind: Int {
@@ -1033,7 +1033,7 @@ struct PreviewPane: View {
                 HStack(alignment: .center, spacing: 12) {
                     FileIconView(record: record, mode: .preview, size: 44)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(record.name)
+                        Text(record.displayLabel)
                             .font(.headline)
                             .lineLimit(2)
                         Text(displayKind(record))

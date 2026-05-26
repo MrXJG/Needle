@@ -53,11 +53,13 @@ struct NeedleCoreCheck {
         let engine = SearchEngine()
         let records = [
             makeRecord(path: "/tmp/App.swift", name: "App.swift", kind: .file, ext: "swift"),
-            makeRecord(path: "/tmp/App", name: "App", kind: .folder, ext: "")
+            makeRecord(path: "/tmp/App", name: "App", kind: .folder, ext: ""),
+            makeRecord(path: "/Applications/WeChat.app", name: "WeChat.app", displayName: "微信.app", kind: .folder, ext: "app")
         ]
         let query = SearchQuery.parse("app ext:swift", kindFilter: .files)
         let results = engine.search(records, query: query)
         try expect(results.map(\.path) == ["/tmp/App.swift"], "kind and extension filters should combine")
+        try expect(engine.search(records, query: .parse("微信.app")).map(\.path) == ["/Applications/WeChat.app"], "localized app display names should be searchable")
     }
 
     private static func checkPatternSearch() throws {
@@ -107,11 +109,12 @@ struct NeedleCoreCheck {
         let store = SQLiteStore(databaseURL: url)
         try await store.open()
         try await store.upsert([
-            makeRecord(path: "/tmp/Readme.md", name: "Readme.md", ext: "md")
+            makeRecord(path: "/tmp/Readme.md", name: "Readme.md", displayName: "说明.md", ext: "md")
         ])
         try await store.recordOpen(path: "/tmp/Readme.md", at: Date(timeIntervalSince1970: 1_750_000_000))
         let records = try await store.loadAll()
         try expect(records.count == 1, "SQLite should load inserted record")
+        try expect(records.first?.displayName == "说明.md", "SQLite should persist display name")
         try expect(records.first?.openCount == 1, "SQLite should persist open count")
         try expect(records.first?.lastOpenedAt == Date(timeIntervalSince1970: 1_750_000_000), "SQLite should persist last opened time")
     }
@@ -125,6 +128,7 @@ struct NeedleCoreCheck {
     private static func makeRecord(
         path: String,
         name: String,
+        displayName: String = "",
         kind: FileKind = .file,
         ext: String = "txt"
     ) -> FileRecord {
@@ -132,6 +136,7 @@ struct NeedleCoreCheck {
             path: path,
             name: name,
             parentPath: URL(fileURLWithPath: path).deletingLastPathComponent().path,
+            displayName: displayName,
             kind: kind,
             ext: ext,
             size: 100,
