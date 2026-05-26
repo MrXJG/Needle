@@ -839,7 +839,7 @@ struct ResultsList: View, @preconcurrency Equatable {
                 .padding(.vertical, 3)
             }
             TableColumn("类型", value: \.needleSortKind) { record in
-                Text(displayKind(record.kind))
+                Text(displayKind(record))
                     .foregroundStyle(.secondary)
             }
             .width(70)
@@ -894,8 +894,12 @@ struct ResultsList: View, @preconcurrency Equatable {
         }
     }
 
-    private func displayKind(_ kind: FileKind) -> String {
-        switch kind {
+    private func displayKind(_ record: FileRecord) -> String {
+        if record.isApplicationBundle {
+            return "应用程序"
+        }
+
+        switch record.kind {
         case .file:
             return "文件"
         case .folder:
@@ -912,13 +916,17 @@ private extension FileRecord {
     }
 
     var needleSortKind: Int {
+        if isApplicationBundle {
+            return 0
+        }
+
         switch kind {
         case .folder:
-            return 0
-        case .file:
             return 1
-        case .other:
+        case .file:
             return 2
+        case .other:
+            return 3
         }
     }
 
@@ -1028,7 +1036,7 @@ struct PreviewPane: View {
                         Text(record.name)
                             .font(.headline)
                             .lineLimit(2)
-                        Text(displayKind(record.kind))
+                        Text(displayKind(record))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -1261,8 +1269,12 @@ struct PreviewPane: View {
         return prefix == "/" ? "/.../\(suffix)" : "\(prefix)/.../\(suffix)"
     }
 
-    private func displayKind(_ kind: FileKind) -> String {
-        switch kind {
+    private func displayKind(_ record: FileRecord) -> String {
+        if record.isApplicationBundle {
+            return "应用程序"
+        }
+
+        switch record.kind {
         case .file:
             return "文件"
         case .folder:

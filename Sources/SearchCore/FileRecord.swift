@@ -17,6 +17,10 @@ public struct FileRecord: Identifiable, Equatable, Codable, Sendable {
     public var lastOpenedAt: Date?
 
     public var id: String { path }
+    public var isApplicationBundle: Bool {
+        kind == .folder && ext == "app"
+    }
+
     public var parentPath: String {
         guard let slashIndex = path.lastIndex(of: "/"), slashIndex != path.startIndex else {
             return "/"

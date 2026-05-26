@@ -130,6 +130,13 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(results.map(\.path), ["/tmp/App.swift"])
     }
 
+    func testAppBundlesKeepFolderKindButExposeApplicationBundleSemantics() {
+        let record = makeRecord(path: "/Applications/Needle.app", name: "Needle.app", kind: .folder, ext: "app")
+
+        XCTAssertEqual(record.kind, .folder)
+        XCTAssertTrue(record.isApplicationBundle)
+    }
+
     func testFiltersByWildcardAndRegex() {
         let engine = SearchEngine()
         let records = [
