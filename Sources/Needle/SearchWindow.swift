@@ -21,7 +21,12 @@ struct SearchWindow: View {
     @AppStorage("previewPaneWidth") private var previewPaneWidth = 300.0
 
     private var selectedRecord: FileRecord? {
-        model.results.first { $0.id == selection }
+        guard canShowCurrentResults else { return nil }
+        return model.results.first { $0.id == selection }
+    }
+
+    private var canShowCurrentResults: Bool {
+        model.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.isAwaitingSearchResults
     }
 
     var body: some View {
@@ -69,8 +74,21 @@ struct SearchWindow: View {
             PermissionGuideView(model: model, isPresented: $showPermissionGuide)
         }
         .onChange(of: model.results) { _, newResults in
+            guard canShowCurrentResults else {
+                selection = nil
+                return
+            }
             if selection == nil || !newResults.contains(where: { $0.id == selection }) {
                 selection = newResults.first?.id
+            }
+        }
+        .onChange(of: model.hasCurrentSearchResults) { _, isCurrent in
+            if isCurrent {
+                if selection == nil || !model.results.contains(where: { $0.id == selection }) {
+                    selection = model.results.first?.id
+                }
+            } else if !model.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                selection = nil
             }
         }
         .onChange(of: selection) { _, _ in
@@ -318,21 +336,31 @@ private extension SearchWindow {
                 GeometryReader { proxy in
                     let defaultWidth = defaultPreviewPaneWidth(totalWidth: proxy.size.width)
                     let width = clampedPreviewPaneWidth(totalWidth: proxy.size.width)
+                    let isSearchingNewQuery = !canShowCurrentResults
                     HStack(spacing: 0) {
-                        ResultsList(
-                        results: model.results,
-                        selection: $selection,
-                        open: model.open,
-                        openWithApplicationPicker: model.openWithApplicationPicker,
-                        quickLook: { QuickLookPreviewController.shared.preview(record: $0) },
-                        reveal: model.revealInFinder,
-                        openParentFolder: model.openParentFolder,
-                        copyPath: model.copyPath,
-                        copyName: model.copyName,
-                        copyParentPath: model.copyParentPath
-                    )
-                    .equatable()
-                    .frame(minWidth: 520)
+                        ZStack {
+                            if isSearchingNewQuery {
+                                SearchResultsPlaceholder(query: model.queryText)
+                                    .transition(.opacity)
+                            } else {
+                                ResultsList(
+                                    results: model.results,
+                                    selection: $selection,
+                                    open: model.open,
+                                    openWithApplicationPicker: model.openWithApplicationPicker,
+                                    quickLook: { QuickLookPreviewController.shared.preview(record: $0) },
+                                    reveal: model.revealInFinder,
+                                    openParentFolder: model.openParentFolder,
+                                    copyPath: model.copyPath,
+                                    copyName: model.copyName,
+                                    copyParentPath: model.copyParentPath
+                                )
+                                .equatable()
+                                .transition(.opacity)
+                            }
+                        }
+                        .animation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.18, extraBounce: 0), value: isSearchingNewQuery)
+                        .frame(minWidth: 520)
 
                         SplitResizeHandle(
                             previewPaneWidth: $previewPaneWidth,
@@ -341,7 +369,7 @@ private extension SearchWindow {
                             maxWidth: maxPreviewPaneWidth(totalWidth: proxy.size.width)
                         )
 
-                        PreviewPane(record: selectedRecord)
+                        PreviewPane(record: isSearchingNewQuery ? nil : selectedRecord)
                             .frame(width: width)
                     }
                     .onAppear {
@@ -361,7 +389,7 @@ private extension SearchWindow {
 
         if showIndexCompleted {
             CompactStatusBadge(text: "已完成", systemName: "checkmark.circle.fill", tint: .green)
-        } else if model.isSearching && hasVisibleQuery {
+        } else if hasVisibleQuery && (model.isAwaitingSearchResults || model.isSearching || !model.isShowingCurrentSearchResults) {
             SearchLoadingBadge()
                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
         } else if hasVisibleQuery && model.results.isEmpty {
@@ -662,6 +690,36 @@ private struct SearchLoadingBadge: View {
             Capsule()
                 .stroke(.orange.opacity(0.18))
         }
+        .accessibilityLabel("正在搜索")
+        .onAppear {
+            isAnimating = true
+        }
+    }
+}
+
+private struct SearchResultsPlaceholder: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isAnimating = false
+    let query: String
+
+    var body: some View {
+        VStack(spacing: 14) {
+            PacmanLoader(isAnimating: isAnimating && !reduceMotion)
+                .frame(width: 62, height: 26)
+                .accessibilityHidden(true)
+
+            VStack(spacing: 4) {
+                Text("正在搜索")
+                    .font(.headline.weight(.semibold))
+                Text(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "正在准备结果" : "正在查找“\(query)”")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.28))
         .accessibilityLabel("正在搜索")
         .onAppear {
             isAnimating = true

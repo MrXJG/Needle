@@ -30,13 +30,23 @@ public final class SearchAppModel {
     public private(set) var lastFilteredFSEventBatchCount: Int?
     public private(set) var lastRescanPathSample: [String] = []
     public private(set) var isSearching = false
+    public private(set) var isAwaitingSearchResults = false
     public private(set) var isMemoryIndexLoaded = false
+    public private(set) var isLoadingFullIndex = false
     public private(set) var executedSearchCount = 0
     public private(set) var skippedSearchCount = 0
     public private(set) var updateCheckState: UpdateCheckState = .idle
     public private(set) var lastUpdateCheckedAt: Date?
     public private(set) var currentAppVersion: String
     public private(set) var latestKnownVersion: String?
+
+    public var hasCurrentSearchResults: Bool {
+        lastDisplayedSearchContext == currentDisplaySearchContext()
+    }
+
+    public var isShowingCurrentSearchResults: Bool {
+        hasCurrentSearchResults && pendingSearchContext == nil && !isAwaitingSearchResults
+    }
 
     public var queryText: String = "" {
         didSet { scheduleSearch(showActivity: true) }
@@ -93,14 +103,22 @@ public final class SearchAppModel {
     private var visibilityMonitorTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
     private var backgroundUnloadTask: Task<Void, Never>?
+    private var fullIndexLoadTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var recordsRevision: UInt64 = 0
     private var lastCompletedSearchContext: SearchContext?
+    private var lastDisplayedSearchContext: SearchDisplayContext?
+    private var pendingSearchContext: SearchContext?
+    private var requiresInitialRebuildAfterOnboardingMigration = false
     private var workspaceObservers: [NSObjectProtocol] = []
     private let pendingRescanPathLimit = 512
     private let fileManager = FileManager.default
     private let updateCheckInterval: TimeInterval = 60 * 60 * 24
     private let backgroundUnloadDelay: Duration
+    private let searchDebounceDelay: Duration
+    private let searchActivityDelay: Duration
+    private let searchPresentationDelay: Duration
+    private let startupPreviewLimit = 200
 
     private struct SearchContext: Equatable {
         let queryText: String
@@ -109,10 +127,19 @@ public final class SearchAppModel {
         let recordsRevision: UInt64
     }
 
+    private struct SearchDisplayContext: Equatable {
+        let queryText: String
+        let kindFilter: KindFilter
+        let matchPath: Bool
+    }
+
     public init(
         databaseURL: URL = SearchAppModel.defaultDatabaseURL(),
         preferences: AppPreferences = AppPreferences(),
-        backgroundUnloadDelay: Duration = .seconds(2)
+        backgroundUnloadDelay: Duration = .seconds(2),
+        searchDebounceDelay: Duration = .milliseconds(80),
+        searchActivityDelay: Duration = .milliseconds(180),
+        searchPresentationDelay: Duration = .milliseconds(160)
     ) {
         let modelBox = ModelBox()
         let backgroundEventBuffer = BackgroundEventBuffer(pathLimit: 512)
@@ -122,8 +149,19 @@ public final class SearchAppModel {
         self.indexer = FileIndexer()
         self.preferences = preferences
         self.backgroundUnloadDelay = backgroundUnloadDelay
+        self.searchDebounceDelay = searchDebounceDelay
+        self.searchActivityDelay = searchActivityDelay
+        self.searchPresentationDelay = searchPresentationDelay
         let loadedSettings = preferences.load()
-        let loadedAppSettings = preferences.loadAppSettings()
+        var loadedAppSettings = preferences.loadAppSettings()
+        let shouldRebuildAfterOnboardingMigration: Bool
+        if !loadedAppSettings.hasCompletedOnboarding, !loadedSettings.roots.isEmpty {
+            loadedAppSettings.hasCompletedOnboarding = true
+            preferences.save(loadedAppSettings)
+            shouldRebuildAfterOnboardingMigration = true
+        } else {
+            shouldRebuildAfterOnboardingMigration = false
+        }
         self.settings = loadedSettings
         self.appSettings = loadedAppSettings
         self.matchPath = loadedSettings.matchPathByDefault
@@ -140,6 +178,7 @@ public final class SearchAppModel {
             }
         }
         modelBox.model = self
+        self.requiresInitialRebuildAfterOnboardingMigration = shouldRebuildAfterOnboardingMigration
         startVisibilityMonitorIfNeeded()
     }
 
@@ -160,42 +199,52 @@ public final class SearchAppModel {
         state = .loading
         do {
             try await store.open()
-            let loadedRecords = try await store.loadAll()
-            let scopedRecords = filterIndexSettingsRecords(from: loadedRecords)
-            if scopedRecords.count != loadedRecords.count {
-                try await store.replaceAll(with: scopedRecords)
-            }
-            recordsStorage = filterPermissionRestrictedRecords(from: scopedRecords)
-            recordsRevision &+= 1
-            isMemoryIndexLoaded = true
-            indexedRecordCount = recordsStorage.count
-            refreshResults()
+            let previewRecords = try await store.loadPreview(limit: startupPreviewLimit)
+            let totalRecordCount = try await store.recordCount()
+            let visiblePreviewRecords = Self.visibleRecords(
+                from: previewRecords,
+                settings: settings,
+                fullDiskAccessGranted: permissionStatus.fullDiskAccessGranted
+            )
+            recordsStorage = visiblePreviewRecords
+            results = Array(visiblePreviewRecords.prefix(startupPreviewLimit))
+            indexedRecordCount = totalRecordCount
+            isMemoryIndexLoaded = false
+            isLoadingFullIndex = true
             if appSettings.hasCompletedOnboarding {
                 startWatching()
-                if recordsStorage.isEmpty && !settings.roots.isEmpty {
+                if (totalRecordCount == 0 || requiresInitialRebuildAfterOnboardingMigration) && !settings.roots.isEmpty {
+                    requiresInitialRebuildAfterOnboardingMigration = false
                     await rebuildIndex()
                 } else {
                     indexedSettings = settings
-                    state = settings.roots.isEmpty ? .idle : .watching
+                    state = settings.roots.isEmpty ? .idle : .loading
+                    loadFullIndexInBackground(pruneExcludedRecords: true)
                 }
                 scheduleAutomaticUpdateCheckIfNeeded()
             } else {
                 indexedSettings = settings
+                isLoadingFullIndex = false
                 state = .idle
             }
         } catch {
+            isLoadingFullIndex = false
             lastError = error.localizedDescription
             state = .degraded(error.localizedDescription)
         }
     }
 
     public func rebuildIndex() async {
+        fullIndexLoadTask?.cancel()
+        fullIndexLoadTask = nil
+        isLoadingFullIndex = false
         guard !settings.roots.isEmpty else {
             recordsStorage = []
             recordsRevision &+= 1
             isMemoryIndexLoaded = true
             indexedRecordCount = 0
             results = []
+            isAwaitingSearchResults = false
             stopSearchActivity()
             state = .idle
             return
@@ -232,6 +281,52 @@ public final class SearchAppModel {
         } catch {
             lastError = error.localizedDescription
             state = .degraded(error.localizedDescription)
+        }
+    }
+
+    private func loadFullIndexInBackground(pruneExcludedRecords: Bool) {
+        fullIndexLoadTask?.cancel()
+        let settings = settings
+        let fullDiskAccessGranted = permissionStatus.fullDiskAccessGranted
+        fullIndexLoadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let loadedRecords = try await self.store.loadAll()
+                guard !Task.isCancelled else { return }
+                let scopedRecords = await Task.detached(priority: .utility) {
+                    Self.scopedRecords(from: loadedRecords, settings: settings)
+                }.value
+
+                if pruneExcludedRecords, scopedRecords.count != loadedRecords.count {
+                    try await self.store.replaceAll(with: scopedRecords)
+                }
+
+                guard !Task.isCancelled else { return }
+                let visibleRecords = await Task.detached(priority: .utility) {
+                    Self.visibleRecords(
+                        from: scopedRecords,
+                        settings: settings,
+                        fullDiskAccessGranted: fullDiskAccessGranted
+                    )
+                }.value
+
+                guard !Task.isCancelled else { return }
+                self.recordsStorage = visibleRecords
+                self.recordsRevision &+= 1
+                self.isMemoryIndexLoaded = true
+                self.indexedRecordCount = visibleRecords.count
+                self.indexedSettings = self.settings
+                await self.refreshResultsImmediately()
+                self.isLoadingFullIndex = false
+                self.state = self.settings.roots.isEmpty ? .idle : .watching
+                self.fullIndexLoadTask = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.isLoadingFullIndex = false
+                self.fullIndexLoadTask = nil
+                self.lastError = error.localizedDescription
+                self.state = .degraded(error.localizedDescription)
+            }
         }
     }
 
@@ -392,6 +487,9 @@ public final class SearchAppModel {
         searchGeneration += 1
         searchTask?.cancel()
         searchTask = nil
+        fullIndexLoadTask?.cancel()
+        fullIndexLoadTask = nil
+        isLoadingFullIndex = false
         rescanTask?.cancel()
         rescanTask = nil
         stopSearchActivity()
@@ -480,6 +578,7 @@ public final class SearchAppModel {
         let context = currentSearchContext()
         if shouldSkipSearch(for: context) {
             skippedSearchCount += 1
+            isAwaitingSearchResults = false
             stopSearchActivity()
             return
         }
@@ -508,16 +607,20 @@ public final class SearchAppModel {
     }
 
     private func scheduleSearch(showActivity: Bool) {
-        scheduleSearch(delay: .milliseconds(80), showActivity: showActivity)
+        scheduleSearch(delay: searchDebounceDelay, showActivity: showActivity)
     }
 
     private func scheduleSearch(delay: Duration, showActivity: Bool) {
         searchGeneration += 1
         let generation = searchGeneration
-        guard isMemoryIndexLoaded else { return }
         let context = currentSearchContext()
+        guard isMemoryIndexLoaded else {
+            handleSearchRequestedBeforeMemoryIndexLoaded(context: context, showActivity: showActivity)
+            return
+        }
         if shouldSkipSearch(for: context) {
             skippedSearchCount += 1
+            isAwaitingSearchResults = false
             stopSearchActivity()
             return
         }
@@ -529,11 +632,19 @@ public final class SearchAppModel {
 
         searchTask?.cancel()
         if showActivity {
-            beginSearchActivityIfSlow(generation: generation)
+            let trimmedQuery = context.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isNewVisibleQuery = !trimmedQuery.isEmpty && lastDisplayedSearchContext != currentDisplaySearchContext()
+            if isNewVisibleQuery {
+                results = []
+                lastDisplayedSearchContext = nil
+            }
+            isAwaitingSearchResults = !trimmedQuery.isEmpty
+            pendingSearchContext = context
+            beginSearchActivityIfSlow(generation: generation, context: context)
         } else {
             stopSearchActivity()
         }
-        guard !isRescanning else {
+        guard !isRescanning || showActivity else {
             needsSearchAfterRescan = true
             return
         }
@@ -563,9 +674,33 @@ public final class SearchAppModel {
                 self.applySearchResults(results.results, validateExistence: self.shouldValidateResultExistence(for: context))
                 self.lastSearchDurationMS = results.duration
                 self.lastCompletedSearchContext = context
-                self.stopSearchActivity()
+                self.finishSearchActivityAfterPresentation(generation: generation, context: context)
             }
         }
+    }
+
+    private func handleSearchRequestedBeforeMemoryIndexLoaded(context: SearchContext, showActivity: Bool) {
+        searchTask?.cancel()
+        queryWarning = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath).validationMessage
+        guard showActivity else {
+            stopSearchActivity()
+            return
+        }
+
+        let trimmedQuery = context.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            isAwaitingSearchResults = false
+            pendingSearchContext = nil
+            isSearching = false
+            results = Array(recordsStorage.prefix(startupPreviewLimit))
+            return
+        }
+
+        results = []
+        lastDisplayedSearchContext = nil
+        isAwaitingSearchResults = true
+        pendingSearchContext = context
+        beginSearchActivityIfSlow(generation: searchGeneration, context: context)
     }
 
     private func currentSearchContext() -> SearchContext {
@@ -577,21 +712,34 @@ public final class SearchAppModel {
         )
     }
 
+    private func currentDisplaySearchContext() -> SearchDisplayContext {
+        SearchDisplayContext(
+            queryText: queryText,
+            kindFilter: kindFilter,
+            matchPath: matchPath
+        )
+    }
+
     private func shouldSkipSearch(for context: SearchContext) -> Bool {
         guard lastCompletedSearchContext == context else { return false }
         return !results.contains(where: { !fileManager.fileExists(atPath: $0.path) })
     }
 
-    private func beginSearchActivityIfSlow(generation: Int) {
+    private func beginSearchActivityIfSlow(generation: Int, context: SearchContext) {
         searchActivityTask?.cancel()
         isSearching = false
-        guard !recordsStorage.isEmpty else { return }
+        guard !recordsStorage.isEmpty else {
+            pendingSearchContext = nil
+            return
+        }
+        let delay = searchActivityDelay
 
         searchActivityTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self, self.searchGeneration == generation else { return }
+                guard self.pendingSearchContext == context else { return }
                 self.isSearching = true
             }
         }
@@ -600,22 +748,49 @@ public final class SearchAppModel {
     private func stopSearchActivity() {
         searchActivityTask?.cancel()
         searchActivityTask = nil
+        pendingSearchContext = nil
         isSearching = false
     }
 
+    private func finishSearchActivityAfterPresentation(generation: Int, context: SearchContext) {
+        searchActivityTask?.cancel()
+        searchActivityTask = nil
+        guard !context.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            stopSearchActivity()
+            return
+        }
+
+        pendingSearchContext = context
+        isSearching = true
+        let delay = searchPresentationDelay
+        searchActivityTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.searchGeneration == generation else { return }
+                guard self.pendingSearchContext == context else { return }
+                self.stopSearchActivity()
+            }
+        }
+    }
+
     private func applySearchResults(_ candidates: [FileRecord], validateExistence: Bool) {
+        isAwaitingSearchResults = false
         guard !candidates.isEmpty else {
             if shouldRestoreDefaultResultsWhenCandidatesAreEmpty() {
                 results = Array(recordsStorage.prefix(200))
+                lastDisplayedSearchContext = currentDisplaySearchContext()
                 lastCompletedSearchContext = currentSearchContext()
                 return
             }
             results = []
+            lastDisplayedSearchContext = currentDisplaySearchContext()
             return
         }
 
         guard validateExistence else {
             results = candidates
+            lastDisplayedSearchContext = currentDisplaySearchContext()
             return
         }
 
@@ -632,6 +807,7 @@ public final class SearchAppModel {
         }
 
         results = visible
+        lastDisplayedSearchContext = currentDisplaySearchContext()
         guard !missingPaths.isEmpty else { return }
 
         recordsStorage.removeAll { missingPaths.contains($0.path) }
@@ -1116,6 +1292,7 @@ public final class SearchAppModel {
         recordsRevision &+= 1
         lastCompletedSearchContext = nil
         isMemoryIndexLoaded = false
+        isLoadingFullIndex = false
         if hadLoadedResources {
             malloc_zone_pressure_relief(nil, 0)
             NotificationCenter.default.post(name: .needleDidUnloadForegroundResources, object: nil)
@@ -1431,6 +1608,27 @@ public final class SearchAppModel {
         guard !permissionStatus.fullDiskAccessGranted else { return records }
         return records.filter { record in
             !Self.isProtectedAppDataPath(record.path)
+        }
+    }
+
+    nonisolated private static func scopedRecords(
+        from records: [FileRecord],
+        settings: IndexSettings
+    ) -> [FileRecord] {
+        records.filter { record in
+            settings.shouldIndex(path: record.path, name: record.name)
+        }
+    }
+
+    nonisolated private static func visibleRecords(
+        from records: [FileRecord],
+        settings: IndexSettings,
+        fullDiskAccessGranted: Bool
+    ) -> [FileRecord] {
+        let scopedRecords = scopedRecords(from: records, settings: settings)
+        guard !fullDiskAccessGranted else { return scopedRecords }
+        return scopedRecords.filter { record in
+            !isProtectedAppDataPath(record.path)
         }
     }
 

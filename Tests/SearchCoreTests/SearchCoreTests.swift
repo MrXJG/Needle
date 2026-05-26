@@ -162,6 +162,43 @@ final class SearchCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testNewQueryClearsStaleVisibleResultsUntilMatchingResultsApply() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let atomURL = directory.appendingPathComponent("atom.txt")
+        let javaURL = directory.appendingPathComponent("java.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("atom".utf8).write(to: atomURL)
+        try Data("java".utf8).write(to: javaURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            searchDebounceDelay: .milliseconds(500),
+            searchActivityDelay: .milliseconds(20)
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        await model.rebuildIndex()
+        model.queryText = "atom"
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [atomURL.standardizedFileURL.path])
+
+        model.queryText = "java"
+        XCTAssertTrue(model.isAwaitingSearchResults)
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertFalse(model.results.contains { $0.name.localizedCaseInsensitiveContains("atom") })
+
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertFalse(model.isAwaitingSearchResults)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [javaURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
     func testRebuildRefreshesResultsBeforeReportingCompletion() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let downloads = directory.appendingPathComponent("Downloads", isDirectory: true)
@@ -189,6 +226,88 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertFalse(model.isSearching)
         try await Task.sleep(for: .milliseconds(400))
         XCTAssertFalse(model.isSearching)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testSlowSearchShowsDelayedActivityUntilResultsApply() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("slow-target.txt")
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            searchDebounceDelay: .milliseconds(500),
+            searchActivityDelay: .milliseconds(20)
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        await model.rebuildIndex()
+        XCTAssertFalse(model.isSearching)
+        XCTAssertTrue(model.hasCurrentSearchResults)
+        XCTAssertTrue(model.isShowingCurrentSearchResults)
+
+        model.queryText = "slow-target"
+        XCTAssertTrue(model.isAwaitingSearchResults)
+        XCTAssertFalse(model.hasCurrentSearchResults)
+        XCTAssertFalse(model.isShowingCurrentSearchResults)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(model.isSearching)
+        XCTAssertTrue(model.isAwaitingSearchResults)
+
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertFalse(model.isSearching)
+        XCTAssertFalse(model.isAwaitingSearchResults)
+        XCTAssertTrue(model.hasCurrentSearchResults)
+        XCTAssertTrue(model.isShowingCurrentSearchResults)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testFastSearchKeepsActivityUntilResultsCanRender() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("ccpc-target.txt")
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            searchDebounceDelay: .milliseconds(0),
+            searchActivityDelay: .seconds(5),
+            searchPresentationDelay: .milliseconds(300)
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        await model.rebuildIndex()
+        model.queryText = "ccpc"
+        XCTAssertTrue(model.isAwaitingSearchResults)
+        XCTAssertFalse(model.hasCurrentSearchResults)
+        XCTAssertFalse(model.isShowingCurrentSearchResults)
+
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(model.isSearching)
+        XCTAssertFalse(model.isAwaitingSearchResults)
+        XCTAssertTrue(model.hasCurrentSearchResults)
+        XCTAssertFalse(model.isShowingCurrentSearchResults)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertFalse(model.isSearching)
+        XCTAssertFalse(model.isAwaitingSearchResults)
+        XCTAssertTrue(model.hasCurrentSearchResults)
+        XCTAssertTrue(model.isShowingCurrentSearchResults)
 
         try? FileManager.default.removeItem(at: directory)
     }
@@ -252,6 +371,12 @@ final class SearchCoreTests: XCTestCase {
         await model.enterForeground()
 
         XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+        XCTAssertFalse(model.isAwaitingSearchResults)
+
+        await model.rebuildIndex()
+
+        XCTAssertFalse(model.isAwaitingSearchResults)
         XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
 
         try? FileManager.default.removeItem(at: directory)
@@ -355,16 +480,117 @@ final class SearchCoreTests: XCTestCase {
             makeRecord(path: "/Users/me/project/node_modules/pkg/index.js", name: "index.js", ext: "js")
         ])
 
-        let model = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: defaults))
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.save(AppSettings(hasCompletedOnboarding: true))
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: preferences)
         model.settings = IndexSettings(roots: ["/Users/me"], excludedNamePatterns: ["node_modules"], includeHiddenFiles: false)
 
         await model.start()
+        try await waitForFullIndexLoad(model)
 
         XCTAssertEqual(model.indexedRecordCount, 1)
         let persistedPaths = try await store.loadAll().map(\.path)
         XCTAssertEqual(persistedPaths, ["/Users/me/project/App.swift"])
 
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testColdStartDefersFullIndexLoadAndSearchWaitsForCompleteIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let projectURL = directory.appendingPathComponent("project", isDirectory: true)
+        let javaURL = projectURL.appendingPathComponent("java.txt")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let store = SQLiteStore(databaseURL: databaseURL)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        try Data("java".utf8).write(to: javaURL)
+        try await store.open()
+        try await store.upsert((0..<260).map { index in
+            makeRecord(path: projectURL.appendingPathComponent("file-\(index).txt").path, name: "file-\(index).txt")
+        } + [
+            makeRecord(path: javaURL.path, name: "java.txt")
+        ])
+
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.save(AppSettings(hasCompletedOnboarding: true))
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: preferences)
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "java"
+
+        await model.start()
+
+        try await waitForFullIndexLoad(model)
+        XCTAssertEqual(model.indexedRecordCount, 261)
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        try await waitForSearchResults(model)
+
+        XCTAssertFalse(model.isLoadingFullIndex)
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isAwaitingSearchResults)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [javaURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testStartCompletesLegacyOnboardingAndRebuildsSparseExistingIndex() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let syncFolder = directory.appendingPathComponent("飞牛同步", isDirectory: true)
+        let nestedFolder = syncFolder.appendingPathComponent("工作", isDirectory: true)
+        let nestedFile = nestedFolder.appendingPathComponent("报告.txt")
+        try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: nestedFile)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let store = SQLiteStore(databaseURL: databaseURL)
+        try await store.open()
+        try await store.upsert([
+            makeRecord(path: syncFolder.path, name: "飞牛同步", kind: .folder)
+        ])
+
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.save(IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false))
+        preferences.save(AppSettings(hasCompletedOnboarding: false))
+
+        let model = SearchAppModel(databaseURL: databaseURL, preferences: preferences)
+        await model.start()
+
+        let expectedSyncFolderPath = normalizedTestPath(syncFolder.path)
+        let expectedNestedFolderPath = normalizedTestPath(nestedFolder.path)
+        let expectedNestedFilePath = normalizedTestPath(nestedFile.path)
+        let persistedAppSettings = preferences.loadAppSettings()
+        let indexedPaths = Set(try await store.loadAll().map(\.path))
+        XCTAssertTrue(persistedAppSettings.hasCompletedOnboarding)
+        XCTAssertTrue(indexedPaths.contains(expectedSyncFolderPath), "Indexed paths: \(indexedPaths.sorted())")
+        XCTAssertTrue(indexedPaths.contains(expectedNestedFolderPath), "Indexed paths: \(indexedPaths.sorted())")
+        XCTAssertTrue(indexedPaths.contains(expectedNestedFilePath), "Indexed paths: \(indexedPaths.sorted())")
+        XCTAssertTrue(
+            model.results.contains { $0.path == expectedSyncFolderPath || $0.path == expectedNestedFilePath },
+            "Results: \(model.results.map { $0.path })"
+        )
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testIndexerScansChineseVisibleHomeFolderDescendants() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let syncFolder = home.appendingPathComponent("飞牛同步", isDirectory: true)
+        let nestedFolder = syncFolder.appendingPathComponent("工作", isDirectory: true)
+        let nestedFile = nestedFolder.appendingPathComponent("报告.txt")
+        try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: nestedFile)
+
+        let indexer = FileIndexer(homeDirectory: home)
+        let result = await indexer.scan(settings: IndexSettings(roots: [home.path], excludedNamePatterns: [], includeHiddenFiles: false))
+        let indexedPaths = Set(result.records.map(\.path))
+
+        XCTAssertTrue(indexedPaths.contains(normalizedTestPath(syncFolder.path)))
+        XCTAssertTrue(indexedPaths.contains(normalizedTestPath(nestedFolder.path)))
+        XCTAssertTrue(indexedPaths.contains(normalizedTestPath(nestedFile.path)))
+
+        try? FileManager.default.removeItem(at: home)
     }
 
     func testSettingsDefaultToNoRootsForSafeFirstLaunch() {
@@ -766,4 +992,38 @@ private func makeRecord(
         openCount: openCount,
         lastOpenedAt: lastOpenedAt
     )
+}
+
+private func normalizedTestPath(_ path: String) -> String {
+    if path.hasPrefix("/var/") {
+        return "/private" + path
+    }
+    return path
+}
+
+@MainActor
+private func waitForFullIndexLoad(
+    _ model: SearchAppModel,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async throws {
+    let deadline = Date().addingTimeInterval(3)
+    while model.isLoadingFullIndex, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    XCTAssertFalse(model.isLoadingFullIndex, file: file, line: line)
+}
+
+@MainActor
+private func waitForSearchResults(
+    _ model: SearchAppModel,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async throws {
+    let deadline = Date().addingTimeInterval(3)
+    while (model.isAwaitingSearchResults || model.results.isEmpty), Date() < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    XCTAssertFalse(model.isAwaitingSearchResults, file: file, line: line)
+    XCTAssertFalse(model.results.isEmpty, file: file, line: line)
 }

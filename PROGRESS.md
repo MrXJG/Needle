@@ -1,8 +1,8 @@
 # Needle Progress
 
 ## Current Status
-- Status: Prototype usable, active polishing.
-- Last updated: 2026-05-25
+- Status: Mature product polishing, release-ready in daily use.
+- Last updated: 2026-05-26
 - Build target: Native macOS 14+ SwiftUI app.
 - Distribution target: Developer ID signed DMG later; current local builds use ad-hoc signing.
 
@@ -27,6 +27,7 @@
 - Preview pane now uses proportional default width and more compact metadata ordering.
 - Menu bar/background running behavior with simplified status, open, settings, rebuild, shortcut, and quit actions.
 - DMG packaging, Developer ID signing hooks, notarization script, and release QA checklist are available.
+- Home page copy has been rewritten as a mature product introduction, with no version number in the headline.
 
 ## Active Improvement Backlog
 
@@ -53,6 +54,7 @@
 - [x] Refine settings section density and reduce nested card weight.
 - [x] Simplify menu bar actions to status, open window, settings, rebuild, shortcut toggle, and quit.
 - [x] Add a crash/error log location and user-facing diagnostics export later.
+- [x] Rewrite GitHub homepage copy into a mature product description.
 
 ### Release Readiness
 - [x] Create DMG packaging flow.

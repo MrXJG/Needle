@@ -168,6 +168,31 @@ public actor SQLiteStore {
         SELECT path, name, kind, ext, size, modified_at, open_count, last_opened_at
         FROM files;
         """
+        return try loadRecords(sql: sql)
+    }
+
+    public func loadPreview(limit: Int) throws -> [FileRecord] {
+        guard limit > 0 else { return [] }
+        let sql = """
+        SELECT path, name, kind, ext, size, modified_at, open_count, last_opened_at
+        FROM files
+        LIMIT \(limit);
+        """
+        return try loadRecords(sql: sql)
+    }
+
+    public func recordCount() throws -> Int {
+        var statement: OpaquePointer?
+        try prepare("SELECT COUNT(*) FROM files;", statement: &statement)
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw SQLiteStoreError.executeFailed(lastErrorMessage)
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func loadRecords(sql: String) throws -> [FileRecord] {
         var statement: OpaquePointer?
         try prepare(sql, statement: &statement)
         defer { sqlite3_finalize(statement) }

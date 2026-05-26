@@ -16,9 +16,11 @@ public struct ScanResult: Sendable {
 
 public actor FileIndexer {
     private let fileManager: FileManager
+    private let homeDirectory: URL
 
-    public init(fileManager: FileManager = .default) {
+    public init(fileManager: FileManager = .default, homeDirectory: URL? = nil) {
         self.fileManager = fileManager
+        self.homeDirectory = homeDirectory ?? fileManager.homeDirectoryForCurrentUser
     }
 
     public func scan(settings: IndexSettings, progress: (@Sendable (Int) async -> Void)? = nil) async -> ScanResult {
@@ -73,6 +75,11 @@ public actor FileIndexer {
                 let protectedRecords = scanSinglePath(protectedURL.path, settings: settings)
                 records.append(contentsOf: protectedRecords)
             }
+
+            for visibleURL in visibleHomeDescendants(under: rootURL, settings: settings) {
+                let visibleRecords = scanSinglePath(visibleURL.path, settings: settings)
+                records.append(contentsOf: visibleRecords)
+            }
         }
 
         await progress?(processed)
@@ -94,31 +101,35 @@ public actor FileIndexer {
             return records
         }
 
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: [
-                .isDirectoryKey,
-                .isRegularFileKey,
-                .fileSizeKey,
-                .contentModificationDateKey
-            ],
-            options: [.skipsPackageDescendants],
-            errorHandler: { _, _ in true }
-        ) else {
-            return records
-        }
-
-        while let childURL = enumerator.nextObject() as? URL {
-            if Task.isCancelled {
-                return records
-            }
-
-            guard settings.shouldIndex(path: childURL.path, name: childURL.lastPathComponent) else {
-                enumerator.skipDescendants()
+        var pendingDirectories = [url]
+        while let directoryURL = pendingDirectories.popLast() {
+            guard let children = try? fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [
+                    .isDirectoryKey,
+                    .isRegularFileKey,
+                    .isPackageKey,
+                    .fileSizeKey,
+                    .contentModificationDateKey
+                ],
+                options: []
+            ) else {
                 continue
             }
-            if let record = FileRecord.fromFileURL(childURL) {
-                records.append(record)
+
+            for childURL in children {
+                guard settings.shouldIndex(path: childURL.path, name: childURL.lastPathComponent) else {
+                    continue
+                }
+                if let record = FileRecord.fromFileURL(childURL) {
+                    records.append(record)
+                }
+                guard let values = try? childURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) else {
+                    continue
+                }
+                if values.isDirectory == true && values.isPackage != true {
+                    pendingDirectories.append(childURL)
+                }
             }
         }
 
@@ -139,7 +150,7 @@ public actor FileIndexer {
     }
 
     private func protectedHomeDescendants(under rootURL: URL) -> [URL] {
-        let home = fileManager.homeDirectoryForCurrentUser
+        let home = homeDirectory
         guard rootURL.path == home.path || home.path.hasPrefix(rootURL.path + "/") else {
             return []
         }
@@ -147,6 +158,27 @@ public actor FileIndexer {
         let protectedNames = ["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures"]
         return protectedNames.map {
             home.appendingPathComponent($0, isDirectory: true)
+        }
+    }
+
+    private func visibleHomeDescendants(under rootURL: URL, settings: IndexSettings) -> [URL] {
+        let home = homeDirectory
+        guard rootURL.path == home.path else { return [] }
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: home,
+            includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let explicitlyHandledNames = Set(["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Library"])
+        return children.filter { url in
+            let name = url.lastPathComponent
+            guard !explicitlyHandledNames.contains(name) else { return false }
+            guard settings.shouldIndex(path: url.path, name: name) else { return false }
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) else { return false }
+            return values.isDirectory == true && values.isPackage != true
         }
     }
 
