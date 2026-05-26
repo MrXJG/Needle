@@ -119,6 +119,7 @@ public final class SearchAppModel {
     private let searchActivityDelay: Duration
     private let searchPresentationDelay: Duration
     private let startupPreviewLimit = 200
+    private let backgroundResultSnapshotLimit = 50
 
     private struct SearchContext: Equatable {
         let queryText: String
@@ -316,7 +317,11 @@ public final class SearchAppModel {
                 self.isMemoryIndexLoaded = true
                 self.indexedRecordCount = visibleRecords.count
                 self.indexedSettings = self.settings
-                await self.refreshResultsImmediately()
+                if !self.pendingRescanPaths.isEmpty {
+                    await self.runPendingRescan()
+                } else {
+                    await self.refreshResultsImmediately()
+                }
                 self.isLoadingFullIndex = false
                 self.state = self.settings.roots.isEmpty ? .idle : .watching
                 self.fullIndexLoadTask = nil
@@ -483,7 +488,6 @@ public final class SearchAppModel {
         }
 
         isBackgroundRequested = true
-        guard state != .loading else { return }
         searchGeneration += 1
         searchTask?.cancel()
         searchTask = nil
@@ -496,6 +500,9 @@ public final class SearchAppModel {
 
         needsSearchAfterRescan = false
         unloadMemoryIndex()
+        if case .loading = state {
+            state = settings.roots.isEmpty ? .idle : .watching
+        }
     }
 
     public func enterForeground() async {
@@ -525,20 +532,33 @@ public final class SearchAppModel {
                 return
             }
 
-            recordsStorage = try await store.loadAll()
-            recordsStorage = filterPermissionRestrictedRecords(from: recordsStorage)
+            let previewRecords = try await store.loadPreview(limit: startupPreviewLimit)
+            let totalRecordCount = try await store.recordCount()
+            recordsStorage = Self.visibleRecords(
+                from: previewRecords,
+                settings: settings,
+                fullDiskAccessGranted: permissionStatus.fullDiskAccessGranted
+            )
             recordsRevision &+= 1
-            indexedRecordCount = recordsStorage.count
-            isMemoryIndexLoaded = true
+            indexedRecordCount = totalRecordCount
+            isMemoryIndexLoaded = false
+            isLoadingFullIndex = true
             indexedSettings = settings
             startWatching()
-            if !pendingRescanPaths.isEmpty {
-                await runPendingRescan()
+            if queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                results = Array(recordsStorage.prefix(startupPreviewLimit))
+                isAwaitingSearchResults = false
+                stopSearchActivity()
             } else {
-                await refreshResultsImmediately()
-                state = settings.roots.isEmpty ? .idle : .watching
+                handleSearchRequestedBeforeMemoryIndexLoaded(
+                    context: currentSearchContext(),
+                    showActivity: true
+                )
             }
+            state = settings.roots.isEmpty ? .idle : .loading
+            loadFullIndexInBackground(pruneExcludedRecords: false)
         } catch {
+            isLoadingFullIndex = false
             lastError = error.localizedDescription
             state = .degraded(error.localizedDescription)
         }
@@ -1288,9 +1308,12 @@ public final class SearchAppModel {
 
     private func unloadMemoryIndex() {
         let hadLoadedResources = hasForegroundResources
+        trimVisibleResultsForBackground()
         recordsStorage = []
         recordsRevision &+= 1
         lastCompletedSearchContext = nil
+        pendingSearchContext = nil
+        lastSearchDurationMS = nil
         isMemoryIndexLoaded = false
         isLoadingFullIndex = false
         if hadLoadedResources {
@@ -1300,11 +1323,23 @@ public final class SearchAppModel {
     }
 
     private var hasForegroundResources: Bool {
-        isMemoryIndexLoaded || !recordsStorage.isEmpty
+        isMemoryIndexLoaded
+            || isLoadingFullIndex
+            || !recordsStorage.isEmpty
+            || results.count > backgroundResultSnapshotLimit
     }
 
     private var hasActiveForegroundWork: Bool {
-        searchTask != nil || searchActivityTask != nil || rescanTask != nil || isRescanning
+        searchTask != nil
+            || searchActivityTask != nil
+            || rescanTask != nil
+            || fullIndexLoadTask != nil
+            || isRescanning
+    }
+
+    private func trimVisibleResultsForBackground() {
+        guard results.count > backgroundResultSnapshotLimit else { return }
+        results = Array(results.prefix(backgroundResultSnapshotLimit))
     }
 
     nonisolated private static func recordsByApplyingRescan(

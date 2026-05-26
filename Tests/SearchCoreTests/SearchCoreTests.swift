@@ -369,6 +369,7 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(model.indexedRecordCount, 1)
 
         await model.enterForeground()
+        try await waitForFullIndexLoad(model)
 
         XCTAssertTrue(model.isMemoryIndexLoaded)
         XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
@@ -378,6 +379,82 @@ final class SearchCoreTests: XCTestCase {
 
         XCTAssertFalse(model.isAwaitingSearchResults)
         XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testBackgroundUnloadTrimsVisibleResultsSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for index in 0..<120 {
+            try Data("fixture".utf8).write(to: directory.appendingPathComponent("report-\(index).md"))
+        }
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            backgroundUnloadDelay: .zero
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "report"
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertGreaterThan(model.results.count, 50)
+
+        model.enterBackground()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+        XCTAssertLessThanOrEqual(model.results.count, 50)
+        XCTAssertEqual(model.indexedRecordCount, 120)
+
+        await model.enterForeground()
+        try await waitForFullIndexLoad(model)
+        try await waitForSearchResults(model)
+
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertGreaterThan(model.results.count, 50)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testBackgroundUnloadCancelsColdStartFullIndexLoad() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for index in 0..<240 {
+            try Data("fixture".utf8).write(to: directory.appendingPathComponent("cold-start-\(index).txt"))
+        }
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let seedDefaults = UserDefaults(suiteName: "NeedleTests.seed.\(UUID().uuidString)")!
+        let seedModel = SearchAppModel(databaseURL: databaseURL, preferences: AppPreferences(defaults: seedDefaults))
+        seedModel.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        await seedModel.start()
+        await seedModel.rebuildIndex()
+
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            backgroundUnloadDelay: .zero
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.appSettings = AppSettings(hasCompletedOnboarding: true)
+
+        await model.start()
+        model.enterBackground()
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+        XCTAssertLessThanOrEqual(model.results.count, 50)
 
         try? FileManager.default.removeItem(at: directory)
     }

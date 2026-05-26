@@ -1058,6 +1058,23 @@ struct PreviewPane: View {
             inlinePreviewTask?.cancel()
             extraMetadataTask?.cancel()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .needleDidUnloadForegroundResources)) { _ in
+            releaseForegroundPreviewResources()
+        }
+    }
+
+    private func releaseForegroundPreviewResources() {
+        folderSizeTask?.cancel()
+        inlinePreviewTask?.cancel()
+        extraMetadataTask?.cancel()
+        folderSizeTask = nil
+        inlinePreviewTask = nil
+        extraMetadataTask = nil
+        folderSizeState = .idle
+        inlinePreviewURL = nil
+        textPreview = .idle
+        extraMetadata = .loading
+        showLocationPopover = false
     }
 
     private func metadataGroup(for record: FileRecord) -> some View {

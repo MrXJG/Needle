@@ -117,6 +117,7 @@ final class GlobalShortcutController {
 private final class SearchWindowDelegate: NSObject, NSWindowDelegate {
     private let didCloseToBackground: () -> Void
     var keepRunningAfterWindowClose = true
+    private var didNotifyHidden = false
 
     init(didCloseToBackground: @escaping () -> Void) {
         self.didCloseToBackground = didCloseToBackground
@@ -128,8 +129,22 @@ private final class SearchWindowDelegate: NSObject, NSWindowDelegate {
         }
 
         sender.orderOut(nil)
-        didCloseToBackground()
+        notifyHiddenIfNeeded()
         return false
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        notifyHiddenIfNeeded()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        didNotifyHidden = false
+    }
+
+    private func notifyHiddenIfNeeded() {
+        guard !didNotifyHidden else { return }
+        didNotifyHidden = true
+        didCloseToBackground()
     }
 }
 
