@@ -81,7 +81,7 @@ struct SettingsView: View {
                 preferenceRow(
                     icon: "shield",
                     title: "完全磁盘访问",
-                    description: "用于读取桌面、文稿、下载等受保护目录。"
+                    description: "用于读取桌面、文稿、下载等受保护目录。开启开关后请重启 Needle 让权限立即生效。"
                 ) {
                     HStack(spacing: 8) {
                         StatusBadge(
@@ -92,13 +92,16 @@ struct SettingsView: View {
                         Button("打开") {
                             model.openPrivacySettings()
                         }
+                        Button("重启") {
+                            NeedleAppDelegate.relaunchCurrentApp()
+                        }
                         HelpTip(
                             title: "为 Needle 授予完全磁盘访问",
                             steps: [
-                                "在系统设置列表下方点击 +。",
-                                "选择 Needle.app 并确认。",
-                                "输入密码后重启 Needle。",
-                                "回到这里点击“刷新状态”。"
+                                "如果列表里已有 Needle，直接打开右侧开关。",
+                                "如果没有 Needle，在列表下方点击 +。",
+                                "选择 /Applications/Needle.app 并确认。",
+                                "点击这里的“重启”按钮让权限生效。"
                             ]
                         )
                     }
@@ -109,13 +112,13 @@ struct SettingsView: View {
                 preferenceRow(
                     icon: "keyboard",
                     title: "辅助功能",
-                    description: "用于监听全局快捷键，不会读取键盘输入内容。"
+                    description: "用于监听全局快捷键，不会读取键盘输入内容。若系统里显示已开启但这里仍未生效，请删除旧条目后重新添加 Needle。"
                 ) {
                     HStack(spacing: 8) {
                         StatusBadge(
                             isOn: model.permissionStatus.accessibilityGranted,
                             onText: "已开启",
-                            offText: "未开启"
+                            offText: "未生效"
                         )
                         Button("打开") {
                             model.openAccessibilitySettings()
@@ -124,9 +127,9 @@ struct SettingsView: View {
                             title: "为 Needle 授予辅助功能权限",
                             steps: [
                                 "在系统设置中找到 Needle。",
-                                "打开 Needle 右侧开关。",
-                                "如系统提示，输入密码确认。",
-                                "回到这里点击“刷新状态”。"
+                                "如果已有 Needle 但这里仍显示未生效，先点 - 删除旧条目。",
+                                "点击 +，重新选择 /Applications/Needle.app。",
+                                "打开 Needle 右侧开关后回到这里点击“刷新状态”。"
                             ]
                         )
                     }

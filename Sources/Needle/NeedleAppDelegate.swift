@@ -48,4 +48,31 @@ final class NeedleAppDelegate: NSObject, NSApplicationDelegate {
         allowImmediateTerminate = true
         NSApplication.shared.terminate(nil)
     }
+
+    static func relaunchCurrentApp() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+        task.arguments = [
+            "/bin/sh",
+            "-c",
+            """
+            pid="$1"
+            app="$2"
+            while /bin/kill -0 "$pid" 2>/dev/null; do
+                /bin/sleep 0.1
+            done
+            /usr/bin/open "$app"
+            """,
+            "needle-relaunch",
+            "\(ProcessInfo.processInfo.processIdentifier)",
+            Bundle.main.bundleURL.path
+        ]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            exit(0)
+        }
+    }
 }

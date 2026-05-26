@@ -23,22 +23,25 @@ struct PermissionGuideView: View {
             permissionRow(
                 icon: "lock.open.display",
                 title: "完全磁盘访问权限",
-                description: "如果要搜索桌面、文稿、下载、照片资料库等位置，需要授予完全磁盘访问权限。推荐方式是在系统设置列表中点击 +，选择 /Applications/Needle.app。",
+                description: "如果要搜索桌面、文稿、下载、照片资料库等位置，需要授予完全磁盘访问权限。已有 Needle 条目时打开开关即可；授权后请重启 Needle。",
                 isComplete: model.permissionStatus.fullDiskAccessGranted,
                 completeText: "已开启",
                 incompleteText: "未确认",
-                buttonTitle: "打开隐私设置"
+                buttonTitle: "打开隐私设置",
+                secondaryButtonTitle: "重启 Needle"
             ) {
                 model.openPrivacySettings()
+            } secondaryAction: {
+                NeedleAppDelegate.relaunchCurrentApp()
             }
 
             permissionRow(
                 icon: "keyboard.badge.eye",
                 title: "辅助功能权限",
-                description: "全局快捷键需要监听键盘事件。macOS 会要求你在辅助功能中允许本应用。",
+                description: "全局快捷键需要监听键盘事件。如果系统里显示已开启但这里仍未生效，请删除旧条目后重新添加 /Applications/Needle.app。",
                 isComplete: model.permissionStatus.accessibilityGranted,
                 completeText: "已开启",
-                incompleteText: "未开启",
+                incompleteText: "未生效",
                 buttonTitle: "打开辅助功能"
             ) {
                 model.openAccessibilitySettings()
@@ -99,7 +102,9 @@ struct PermissionGuideView: View {
         completeText: String,
         incompleteText: String,
         buttonTitle: String,
-        action: @escaping () -> Void
+        secondaryButtonTitle: String? = nil,
+        action: @escaping () -> Void,
+        secondaryAction: (() -> Void)? = nil
     ) -> some View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: icon)
@@ -114,7 +119,12 @@ struct PermissionGuideView: View {
             }
             Spacer()
             StatusBadge(isOn: isComplete, onText: completeText, offText: incompleteText)
-            Button(buttonTitle, action: action)
+            HStack(spacing: 8) {
+                Button(buttonTitle, action: action)
+                if let secondaryButtonTitle, let secondaryAction {
+                    Button(secondaryButtonTitle, action: secondaryAction)
+                }
+            }
         }
         .padding(16)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
