@@ -26,7 +26,7 @@ resolve_app_version() {
 
   if command -v git >/dev/null 2>&1; then
     local latest_tag
-    latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+    latest_tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
     if [[ -n "$latest_tag" ]]; then
       printf '%s' "${latest_tag#v}"
       return

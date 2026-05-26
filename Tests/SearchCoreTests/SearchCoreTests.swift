@@ -412,6 +412,7 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertFalse(model.isMemoryIndexLoaded)
         XCTAssertFalse(model.isLoadingFullIndex)
         XCTAssertLessThanOrEqual(model.results.count, 50)
+        XCTAssertEqual(model.backgroundMemoryStage, .warm)
         XCTAssertEqual(model.indexedRecordCount, 120)
 
         await model.enterForeground()
@@ -420,6 +421,65 @@ final class SearchCoreTests: XCTestCase {
 
         XCTAssertTrue(model.isMemoryIndexLoaded)
         XCTAssertGreaterThan(model.results.count, 50)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testBackgroundMemoryReleaseProgressesThroughWarmDeepAndColdStages() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for index in 0..<120 {
+            try Data("fixture".utf8).write(to: directory.appendingPathComponent("staged-report-\(index).md"))
+        }
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            backgroundUnloadDelay: .zero,
+            backgroundDeepUnloadDelay: .milliseconds(40),
+            backgroundColdUnloadDelay: .milliseconds(90)
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "staged-report"
+
+        await model.start()
+        await model.rebuildIndex()
+
+        XCTAssertEqual(model.backgroundMemoryStage, .foreground)
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertGreaterThan(model.results.count, 50)
+
+        model.enterBackground()
+        try await waitForBackgroundStage(model, .warm)
+
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+        XCTAssertLessThanOrEqual(model.results.count, 50)
+
+        try await waitForBackgroundStage(model, .deep)
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertFalse(model.isAwaitingSearchResults)
+
+        try await waitForBackgroundStage(model, .cold)
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+
+        await model.enterForeground()
+        XCTAssertEqual(model.backgroundMemoryStage, .foreground)
+        XCTAssertTrue(model.isLoadingFullIndex)
+        XCTAssertTrue(model.results.isEmpty)
+        XCTAssertTrue(model.isAwaitingSearchResults)
+
+        try await waitForFullIndexLoad(model)
+        try await waitForSearchResults(model)
+
+        XCTAssertTrue(model.isMemoryIndexLoaded)
+        XCTAssertGreaterThan(model.results.count, 50)
+        XCTAssertFalse(model.isAwaitingSearchResults)
 
         try? FileManager.default.removeItem(at: directory)
     }
@@ -1103,4 +1163,18 @@ private func waitForSearchResults(
     }
     XCTAssertFalse(model.isAwaitingSearchResults, file: file, line: line)
     XCTAssertFalse(model.results.isEmpty, file: file, line: line)
+}
+
+@MainActor
+private func waitForBackgroundStage(
+    _ model: SearchAppModel,
+    _ stage: SearchAppModel.BackgroundMemoryStage,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async throws {
+    let deadline = Date().addingTimeInterval(2)
+    while model.backgroundMemoryStage != stage, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    XCTAssertEqual(model.backgroundMemoryStage, stage, file: file, line: line)
 }

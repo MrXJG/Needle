@@ -14,6 +14,13 @@ public final class SearchAppModel {
         case failed(message: String)
     }
 
+    public enum BackgroundMemoryStage: String, Equatable, Sendable {
+        case foreground
+        case warm
+        case deep
+        case cold
+    }
+
     public private(set) var results: [FileRecord] = []
     public private(set) var indexedRecordCount = 0
     public private(set) var state: IndexerState = .idle
@@ -39,6 +46,7 @@ public final class SearchAppModel {
     public private(set) var lastUpdateCheckedAt: Date?
     public private(set) var currentAppVersion: String
     public private(set) var latestKnownVersion: String?
+    public private(set) var backgroundMemoryStage: BackgroundMemoryStage = .foreground
 
     public var hasCurrentSearchResults: Bool {
         lastDisplayedSearchContext == currentDisplaySearchContext()
@@ -103,6 +111,8 @@ public final class SearchAppModel {
     private var visibilityMonitorTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
     private var backgroundUnloadTask: Task<Void, Never>?
+    private var backgroundDeepUnloadTask: Task<Void, Never>?
+    private var backgroundColdUnloadTask: Task<Void, Never>?
     private var fullIndexLoadTask: Task<Void, Never>?
     private var searchGeneration = 0
     private var recordsRevision: UInt64 = 0
@@ -115,6 +125,8 @@ public final class SearchAppModel {
     private let fileManager = FileManager.default
     private let updateCheckInterval: TimeInterval = 60 * 60 * 24
     private let backgroundUnloadDelay: Duration
+    private let backgroundDeepUnloadDelay: Duration
+    private let backgroundColdUnloadDelay: Duration
     private let searchDebounceDelay: Duration
     private let searchActivityDelay: Duration
     private let searchPresentationDelay: Duration
@@ -138,6 +150,8 @@ public final class SearchAppModel {
         databaseURL: URL = SearchAppModel.defaultDatabaseURL(),
         preferences: AppPreferences = AppPreferences(),
         backgroundUnloadDelay: Duration = .seconds(2),
+        backgroundDeepUnloadDelay: Duration = .seconds(45),
+        backgroundColdUnloadDelay: Duration = .seconds(180),
         searchDebounceDelay: Duration = .milliseconds(80),
         searchActivityDelay: Duration = .milliseconds(180),
         searchPresentationDelay: Duration = .milliseconds(160)
@@ -150,6 +164,8 @@ public final class SearchAppModel {
         self.indexer = FileIndexer()
         self.preferences = preferences
         self.backgroundUnloadDelay = backgroundUnloadDelay
+        self.backgroundDeepUnloadDelay = backgroundDeepUnloadDelay
+        self.backgroundColdUnloadDelay = backgroundColdUnloadDelay
         self.searchDebounceDelay = searchDebounceDelay
         self.searchActivityDelay = searchActivityDelay
         self.searchPresentationDelay = searchPresentationDelay
@@ -468,26 +484,29 @@ public final class SearchAppModel {
     }
 
     public func enterBackground() {
-        backgroundUnloadTask?.cancel()
+        cancelBackgroundReleaseTasks()
         let delay = backgroundUnloadDelay
         backgroundUnloadTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             await MainActor.run {
                 guard let self, !Self.hasVisibleSearchWindow else { return }
-                self.performBackgroundUnload()
+                self.performWarmBackgroundUnload()
             }
         }
     }
 
-    private func performBackgroundUnload() {
+    private func performWarmBackgroundUnload() {
         guard !Self.hasVisibleSearchWindow else { return }
         backgroundUnloadTask = nil
         backgroundEventBuffer.enterBackground()
         if isBackgroundRequested, !hasForegroundResources, !hasActiveForegroundWork {
+            scheduleDeepBackgroundUnloadIfNeeded()
+            scheduleColdBackgroundUnloadIfNeeded()
             return
         }
 
         isBackgroundRequested = true
+        backgroundMemoryStage = .warm
         searchGeneration += 1
         searchTask?.cancel()
         searchTask = nil
@@ -503,11 +522,82 @@ public final class SearchAppModel {
         if case .loading = state {
             state = settings.roots.isEmpty ? .idle : .watching
         }
+        scheduleDeepBackgroundUnloadIfNeeded()
+        scheduleColdBackgroundUnloadIfNeeded()
+    }
+
+    private func scheduleDeepBackgroundUnloadIfNeeded() {
+        backgroundDeepUnloadTask?.cancel()
+        let delay = backgroundDeepUnloadDelay
+        backgroundDeepUnloadTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            await MainActor.run {
+                guard let self, !Self.hasVisibleSearchWindow else { return }
+                self.performDeepBackgroundUnload()
+            }
+        }
+    }
+
+    private func scheduleColdBackgroundUnloadIfNeeded() {
+        backgroundColdUnloadTask?.cancel()
+        let delay = backgroundColdUnloadDelay
+        backgroundColdUnloadTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            await MainActor.run {
+                guard let self, !Self.hasVisibleSearchWindow else { return }
+                self.performColdBackgroundUnload()
+            }
+        }
+    }
+
+    private func performDeepBackgroundUnload() {
+        guard isBackgroundRequested, !Self.hasVisibleSearchWindow else { return }
+        backgroundDeepUnloadTask = nil
+        backgroundMemoryStage = .deep
+        results = []
+        lastDisplayedSearchContext = nil
+        lastCompletedSearchContext = nil
+        pendingSearchContext = nil
+        lastSearchDurationMS = nil
+        queryWarning = nil
+        isAwaitingSearchResults = false
+        stopSearchActivity()
+        malloc_zone_pressure_relief(nil, 0)
+        NotificationCenter.default.post(name: .needleDidUnloadForegroundResources, object: nil)
+    }
+
+    private func performColdBackgroundUnload() {
+        guard isBackgroundRequested, !Self.hasVisibleSearchWindow else { return }
+        backgroundColdUnloadTask = nil
+        backgroundMemoryStage = .cold
+        results = []
+        recordsStorage = []
+        recordsRevision &+= 1
+        lastDisplayedSearchContext = nil
+        lastCompletedSearchContext = nil
+        pendingSearchContext = nil
+        lastSearchDurationMS = nil
+        queryWarning = nil
+        isAwaitingSearchResults = false
+        stopSearchActivity()
+        isMemoryIndexLoaded = false
+        isLoadingFullIndex = false
+        malloc_zone_pressure_relief(nil, 0)
+        NotificationCenter.default.post(name: .needleDidUnloadForegroundResources, object: nil)
+    }
+
+    private func cancelBackgroundReleaseTasks() {
+        backgroundUnloadTask?.cancel()
+        backgroundUnloadTask = nil
+        backgroundDeepUnloadTask?.cancel()
+        backgroundDeepUnloadTask = nil
+        backgroundColdUnloadTask?.cancel()
+        backgroundColdUnloadTask = nil
     }
 
     public func enterForeground() async {
-        backgroundUnloadTask?.cancel()
-        backgroundUnloadTask = nil
+        cancelBackgroundReleaseTasks()
+        backgroundMemoryStage = .foreground
         if let update = backgroundEventBuffer.drainAndEnterForeground() {
             queueRawBackgroundEvents(update)
         }
@@ -880,6 +970,7 @@ public final class SearchAppModel {
         lines.append("Records: \(indexedRecordCount)")
         lines.append("Memory index loaded: \(isMemoryIndexLoaded)")
         lines.append("Visible results: \(results.count)")
+        lines.append("Background memory stage: \(backgroundMemoryStage.rawValue)")
         lines.append("State: \(stateDescription)")
         lines.append("Index needs rebuild: \(indexNeedsRebuild)")
         lines.append("Last search duration ms: \(formattedMetric(lastSearchDurationMS))")
