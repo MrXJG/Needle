@@ -71,7 +71,9 @@ struct SearchWindow: View {
             }
         }
         .sheet(isPresented: $showPermissionGuide) {
-            PermissionGuideView(model: model, isPresented: $showPermissionGuide)
+            PermissionGuideView(model: model, isPresented: $showPermissionGuide) {
+                openSettings()
+            }
         }
         .onChange(of: model.results) { _, newResults in
             guard canShowCurrentResults else {

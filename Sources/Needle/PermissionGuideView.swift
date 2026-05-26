@@ -4,6 +4,7 @@ import SwiftUI
 struct PermissionGuideView: View {
     @Bindable var model: SearchAppModel
     @Binding var isPresented: Bool
+    let onOpenSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -17,18 +18,6 @@ struct PermissionGuideView: View {
                     Text("为了快速搜索本机文件，先完成三个基础设置。")
                         .foregroundStyle(.secondary)
                 }
-            }
-
-            permissionRow(
-                icon: "externaldrive.badge.checkmark",
-                title: "选择索引范围",
-                description: "建议先选择一个小目录测试，再逐步加入个人文件夹或外接磁盘。",
-                isComplete: !model.settings.roots.isEmpty,
-                completeText: "已选择",
-                incompleteText: "未选择",
-                buttonTitle: "打开设置"
-            ) {
-                isPresented = false
             }
 
             permissionRow(
@@ -53,6 +42,21 @@ struct PermissionGuideView: View {
                 buttonTitle: "打开辅助功能"
             ) {
                 model.openAccessibilitySettings()
+            }
+
+            permissionRow(
+                icon: "externaldrive.badge.checkmark",
+                title: "选择索引范围",
+                description: "建议先选择一个小目录测试，再逐步加入个人文件夹或外接磁盘。",
+                isComplete: !model.settings.roots.isEmpty,
+                completeText: "已选择",
+                incompleteText: "未选择",
+                buttonTitle: "打开设置"
+            ) {
+                isPresented = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                    onOpenSettings()
+                }
             }
 
             permissionRow(
