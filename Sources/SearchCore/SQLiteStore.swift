@@ -185,6 +185,79 @@ public actor SQLiteStore {
         return try loadRecords(sql: sql)
     }
 
+    public func searchCandidates(query: SearchQuery, limit: Int) throws -> [FileRecord] {
+        guard limit > 0 else { return [] }
+        guard query.invalidRegexPatterns.isEmpty else { return [] }
+        guard !query.terms.isEmpty || query.extensionFilter != nil else { return [] }
+
+        var clauses: [String] = []
+        var bindings: [String] = []
+
+        switch query.kindFilter {
+        case .all:
+            break
+        case .files:
+            clauses.append("kind = ?")
+            bindings.append(FileKind.file.rawValue)
+        case .folders:
+            clauses.append("kind = ?")
+            bindings.append(FileKind.folder.rawValue)
+        }
+
+        if let extensionFilter = query.extensionFilter {
+            clauses.append("ext = ?")
+            bindings.append(extensionFilter)
+        }
+
+        for term in query.terms {
+            let likePattern = "%\(escapedLikePattern(term))%"
+            let searchableColumns = query.matchPath
+                ? ["name", "display_name", "path"]
+                : ["name", "display_name"]
+            clauses.append(
+                searchableColumns
+                    .map { "\($0) LIKE ? COLLATE NOCASE ESCAPE '\\'" }
+                    .joined(separator: " OR ")
+                    .wrappedInParentheses()
+            )
+            bindings.append(contentsOf: Array(repeating: likePattern, count: searchableColumns.count))
+        }
+
+        let whereClause = clauses.isEmpty ? "" : "WHERE \(clauses.joined(separator: " AND "))"
+        let orderClause: String
+        if let firstTerm = query.terms.first {
+            orderClause = """
+            ORDER BY
+                CASE
+                    WHEN name = ? COLLATE NOCASE OR display_name = ? COLLATE NOCASE THEN 0
+                    WHEN name LIKE ? COLLATE NOCASE ESCAPE '\\' OR display_name LIKE ? COLLATE NOCASE ESCAPE '\\' THEN 1
+                    WHEN name LIKE ? COLLATE NOCASE ESCAPE '\\' OR display_name LIKE ? COLLATE NOCASE ESCAPE '\\' THEN 2
+                    ELSE 3
+                END,
+                length(path) ASC,
+                modified_at DESC
+            """
+            let escapedFirstTerm = escapedLikePattern(firstTerm)
+            bindings.append(firstTerm)
+            bindings.append(firstTerm)
+            bindings.append("\(escapedFirstTerm)%")
+            bindings.append("\(escapedFirstTerm)%")
+            bindings.append("%\(escapedFirstTerm)%")
+            bindings.append("%\(escapedFirstTerm)%")
+        } else {
+            orderClause = "ORDER BY length(path) ASC, modified_at DESC"
+        }
+        let sql = """
+        SELECT path, name, display_name, kind, ext, size, modified_at, open_count, last_opened_at
+        FROM files
+        \(whereClause)
+        \(orderClause)
+        LIMIT \(limit);
+        """
+
+        return try loadRecords(sql: sql, bindings: bindings)
+    }
+
     public func recordCount() throws -> Int {
         var statement: OpaquePointer?
         try prepare("SELECT COUNT(*) FROM files;", statement: &statement)
@@ -196,10 +269,14 @@ public actor SQLiteStore {
         return Int(sqlite3_column_int64(statement, 0))
     }
 
-    private func loadRecords(sql: String) throws -> [FileRecord] {
+    private func loadRecords(sql: String, bindings: [String] = []) throws -> [FileRecord] {
         var statement: OpaquePointer?
         try prepare(sql, statement: &statement)
         defer { sqlite3_finalize(statement) }
+
+        for (index, binding) in bindings.enumerated() {
+            sqlite3_bind_text(statement, Int32(index + 1), binding, -1, SQLITE_TRANSIENT)
+        }
 
         var records: [FileRecord] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -297,6 +374,19 @@ public actor SQLiteStore {
         }
         return String(cString: value)
     }
+
+    private func escapedLikePattern(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+    }
 }
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+private extension String {
+    func wrappedInParentheses() -> String {
+        "(\(self))"
+    }
+}

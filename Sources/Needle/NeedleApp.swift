@@ -4,7 +4,7 @@ import SwiftUI
 @main
 struct NeedleApp: App {
     @NSApplicationDelegateAdaptor(NeedleAppDelegate.self) private var appDelegate
-    @State private var model = SearchAppModel()
+    @State private var model = SearchAppModel(preloadFullIndexOnStart: false)
     @State private var shortcutController = GlobalShortcutController()
 
     var body: some Scene {

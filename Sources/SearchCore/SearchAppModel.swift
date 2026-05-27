@@ -100,6 +100,7 @@ public final class SearchAppModel {
     private let databaseURL: URL
     private let databaseDirectoryURL: URL
     @ObservationIgnored private var recordsStorage: [FileRecord] = []
+    @ObservationIgnored private var searchRecordsStorage: [SearchRecord] = []
     private var rescanTask: Task<Void, Never>?
     private var pendingRescanPaths = Set<String>()
     private var deferredBackgroundEventPaths = Set<String>()
@@ -131,8 +132,11 @@ public final class SearchAppModel {
     private let searchDebounceDelay: Duration
     private let searchActivityDelay: Duration
     private let searchPresentationDelay: Duration
+    private let fullIndexLoadDelay: Duration
+    private let preloadFullIndexOnStart: Bool
     private let startupPreviewLimit = 200
     private let backgroundResultSnapshotLimit = 50
+    private let sqliteCandidateLimit = 2_000
 
     private struct SearchContext: Equatable {
         let queryText: String
@@ -155,7 +159,9 @@ public final class SearchAppModel {
         backgroundColdUnloadDelay: Duration = .seconds(180),
         searchDebounceDelay: Duration = .milliseconds(80),
         searchActivityDelay: Duration = .milliseconds(180),
-        searchPresentationDelay: Duration = .milliseconds(160)
+        searchPresentationDelay: Duration = .milliseconds(160),
+        fullIndexLoadDelay: Duration = .zero,
+        preloadFullIndexOnStart: Bool = true
     ) {
         let modelBox = ModelBox()
         let backgroundEventBuffer = BackgroundEventBuffer(pathLimit: 512)
@@ -170,6 +176,8 @@ public final class SearchAppModel {
         self.searchDebounceDelay = searchDebounceDelay
         self.searchActivityDelay = searchActivityDelay
         self.searchPresentationDelay = searchPresentationDelay
+        self.fullIndexLoadDelay = fullIndexLoadDelay
+        self.preloadFullIndexOnStart = preloadFullIndexOnStart
         let loadedSettings = preferences.load()
         var loadedAppSettings = preferences.loadAppSettings()
         let shouldRebuildAfterOnboardingMigration: Bool
@@ -224,11 +232,11 @@ public final class SearchAppModel {
                 settings: settings,
                 fullDiskAccessGranted: permissionStatus.fullDiskAccessGranted
             )
-            recordsStorage = visiblePreviewRecords
+            replaceRecordsStorage(visiblePreviewRecords, bumpRevision: false)
             setResultsIfChanged(Array(visiblePreviewRecords.prefix(startupPreviewLimit)))
             indexedRecordCount = totalRecordCount
             isMemoryIndexLoaded = false
-            isLoadingFullIndex = true
+            isLoadingFullIndex = false
             if appSettings.hasCompletedOnboarding {
                 startWatching()
                 if (totalRecordCount == 0 || requiresInitialRebuildAfterOnboardingMigration) && !settings.roots.isEmpty {
@@ -236,8 +244,10 @@ public final class SearchAppModel {
                     await rebuildIndex()
                 } else {
                     indexedSettings = settings
-                    state = settings.roots.isEmpty ? .idle : .loading
-                    loadFullIndexInBackground(pruneExcludedRecords: true)
+                    state = settings.roots.isEmpty ? .idle : .watching
+                    if preloadFullIndexOnStart {
+                        loadFullIndexInBackground(pruneExcludedRecords: true, delay: fullIndexLoadDelay)
+                    }
                 }
                 scheduleAutomaticUpdateCheckIfNeeded()
             } else {
@@ -257,8 +267,7 @@ public final class SearchAppModel {
         fullIndexLoadTask = nil
         isLoadingFullIndex = false
         guard !settings.roots.isEmpty else {
-            recordsStorage = []
-            recordsRevision &+= 1
+            replaceRecordsStorage([])
             isMemoryIndexLoaded = true
             indexedRecordCount = 0
             setResultsIfChanged([])
@@ -286,8 +295,7 @@ public final class SearchAppModel {
 
         do {
             try await store.replaceAll(with: filteredRecords)
-            recordsStorage = filterPermissionRestrictedRecords(from: filteredRecords)
-            recordsRevision &+= 1
+            replaceRecordsStorage(filterPermissionRestrictedRecords(from: filteredRecords))
             isMemoryIndexLoaded = true
             indexedRecordCount = filteredRecords.count
             blockedPaths = result.blockedPaths
@@ -302,13 +310,20 @@ public final class SearchAppModel {
         }
     }
 
-    private func loadFullIndexInBackground(pruneExcludedRecords: Bool) {
+    private func loadFullIndexInBackground(pruneExcludedRecords: Bool, delay: Duration = .zero) {
         fullIndexLoadTask?.cancel()
         let settings = settings
         let fullDiskAccessGranted = permissionStatus.fullDiskAccessGranted
+        isLoadingFullIndex = delay == .zero
         fullIndexLoadTask = Task { [weak self] in
             guard let self else { return }
             do {
+                if delay > .zero {
+                    try? await Task.sleep(for: delay)
+                    guard !Task.isCancelled else { return }
+                    self.isLoadingFullIndex = true
+                    self.state = self.settings.roots.isEmpty ? .idle : .loading
+                }
                 let loadedRecords = try await self.store.loadAll()
                 guard !Task.isCancelled else { return }
                 let scopedRecords = await Task.detached(priority: .utility) {
@@ -329,8 +344,7 @@ public final class SearchAppModel {
                 }.value
 
                 guard !Task.isCancelled else { return }
-                self.recordsStorage = visibleRecords
-                self.recordsRevision &+= 1
+                self.replaceRecordsStorage(visibleRecords)
                 self.isMemoryIndexLoaded = true
                 self.indexedRecordCount = visibleRecords.count
                 self.indexedSettings = self.settings
@@ -577,8 +591,7 @@ public final class SearchAppModel {
         backgroundColdUnloadTask = nil
         backgroundMemoryStage = .cold
         setResultsIfChanged([])
-        recordsStorage = []
-        recordsRevision &+= 1
+        replaceRecordsStorage([])
         lastDisplayedSearchContext = nil
         lastCompletedSearchContext = nil
         pendingSearchContext = nil
@@ -630,19 +643,18 @@ public final class SearchAppModel {
 
             let previewRecords = try await store.loadPreview(limit: startupPreviewLimit)
             let totalRecordCount = try await store.recordCount()
-            recordsStorage = Self.visibleRecords(
+            replaceRecordsStorage(Self.visibleRecords(
                 from: previewRecords,
                 settings: settings,
                 fullDiskAccessGranted: permissionStatus.fullDiskAccessGranted
-            )
-            recordsRevision &+= 1
+            ))
             indexedRecordCount = totalRecordCount
             isMemoryIndexLoaded = false
             isLoadingFullIndex = true
             indexedSettings = settings
             startWatching()
             if queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
+            setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
                 isAwaitingSearchResults = false
                 stopSearchActivity()
             } else {
@@ -651,8 +663,10 @@ public final class SearchAppModel {
                     showActivity: true
                 )
             }
-            state = settings.roots.isEmpty ? .idle : .loading
-            loadFullIndexInBackground(pruneExcludedRecords: false)
+            state = settings.roots.isEmpty ? .idle : .watching
+            if preloadFullIndexOnStart {
+                loadFullIndexInBackground(pruneExcludedRecords: false, delay: fullIndexLoadDelay)
+            }
         } catch {
             isLoadingFullIndex = false
             lastError = error.localizedDescription
@@ -708,7 +722,8 @@ public final class SearchAppModel {
             stopSearchActivity()
             return
         }
-        let records = recordsStorage
+        let records = searchRecordsStorage
+        let fileRecords = recordsStorage
         let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
         let searchEngine = searchEngine
         let preferredFolderPaths = settings.roots
@@ -719,7 +734,7 @@ public final class SearchAppModel {
 
         let startedAt = CFAbsoluteTimeGetCurrent()
         let searchOutcome = await Task.detached(priority: .userInitiated) {
-            let results = searchEngine.search(records, query: query, preferredFolderPaths: preferredFolderPaths)
+            let results = searchEngine.search(records, records: fileRecords, query: query, preferredFolderPaths: preferredFolderPaths)
             return (results: results, wasCancelled: Task.isCancelled)
         }.value
 
@@ -750,7 +765,8 @@ public final class SearchAppModel {
             stopSearchActivity()
             return
         }
-        let records = recordsStorage
+        let records = searchRecordsStorage
+        let fileRecords = recordsStorage
         let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
         let searchEngine = searchEngine
         let preferredFolderPaths = settings.roots
@@ -781,7 +797,7 @@ public final class SearchAppModel {
 
             let searchJob = Task.detached(priority: .userInitiated) {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let results = searchEngine.search(records, query: query, preferredFolderPaths: preferredFolderPaths)
+                let results = searchEngine.search(records, records: fileRecords, query: query, preferredFolderPaths: preferredFolderPaths)
                 let duration = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
                 return (results: results, duration: duration, wasCancelled: Task.isCancelled)
             }
@@ -807,7 +823,11 @@ public final class SearchAppModel {
 
     private func handleSearchRequestedBeforeMemoryIndexLoaded(context: SearchContext, showActivity: Bool) {
         searchTask?.cancel()
-        queryWarning = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath).validationMessage
+        let generation = searchGeneration
+        let query = SearchQuery.parse(queryText, kindFilter: kindFilter, matchPath: matchPath)
+        let searchEngine = searchEngine
+        let preferredFolderPaths = settings.roots
+        queryWarning = query.validationMessage
         guard showActivity else {
             stopSearchActivity()
             return
@@ -827,6 +847,65 @@ public final class SearchAppModel {
         isAwaitingSearchResults = true
         pendingSearchContext = context
         beginSearchActivityIfSlow(generation: searchGeneration, context: context)
+
+        searchTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.searchDebounceDelay)
+            guard !Task.isCancelled else { return }
+
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            let candidateOutcome: (results: [FileRecord], duration: Double, wasCancelled: Bool)
+            do {
+                let storedCandidates = try await self.store.searchCandidates(query: query, limit: self.sqliteCandidateLimit)
+                guard !Task.isCancelled else { return }
+                let visibleCandidates = Self.visibleRecords(
+                    from: storedCandidates,
+                    settings: self.settings,
+                    fullDiskAccessGranted: self.permissionStatus.fullDiskAccessGranted
+                )
+                let rankedCandidates = searchEngine.search(
+                    visibleCandidates,
+                    query: query,
+                    preferredFolderPaths: preferredFolderPaths
+                )
+                candidateOutcome = (
+                    results: rankedCandidates,
+                    duration: (CFAbsoluteTimeGetCurrent() - startedAt) * 1000,
+                    wasCancelled: Task.isCancelled
+                )
+            } catch {
+                candidateOutcome = (
+                    results: [],
+                    duration: (CFAbsoluteTimeGetCurrent() - startedAt) * 1000,
+                    wasCancelled: Task.isCancelled
+                )
+            }
+
+            await MainActor.run {
+                guard self.searchGeneration == generation else { return }
+                guard !candidateOutcome.wasCancelled else { return }
+                self.executedSearchCount += 1
+                if !candidateOutcome.results.isEmpty {
+                    self.applySearchResults(
+                        candidateOutcome.results,
+                        validateExistence: self.shouldValidateResultExistence(for: context)
+                    )
+                    self.lastCompletedSearchContext = context
+                    self.finishSearchActivityAfterPresentation(generation: generation, context: context)
+                }
+                self.lastSearchDurationMS = candidateOutcome.duration
+                self.startFullIndexLoadForSearchIfNeeded()
+            }
+        }
+    }
+
+    private func startFullIndexLoadForSearchIfNeeded() {
+        if fullIndexLoadTask == nil {
+            loadFullIndexInBackground(pruneExcludedRecords: false, delay: .zero)
+        } else if !isLoadingFullIndex {
+            fullIndexLoadTask?.cancel()
+            loadFullIndexInBackground(pruneExcludedRecords: false, delay: .zero)
+        }
     }
 
     private func currentSearchContext() -> SearchContext {
@@ -937,10 +1016,25 @@ public final class SearchAppModel {
         guard !missingPaths.isEmpty else { return }
 
         recordsStorage.removeAll { missingPaths.contains($0.path) }
+        rebuildSearchRecordsStorage()
         recordsRevision &+= 1
         indexedRecordCount = recordsStorage.count
         pendingRescanPaths.formUnion(missingPaths)
         schedulePendingRescanTask()
+    }
+
+    private func replaceRecordsStorage(_ records: [FileRecord], bumpRevision: Bool = true) {
+        recordsStorage = records
+        rebuildSearchRecordsStorage()
+        if bumpRevision {
+            recordsRevision &+= 1
+        }
+    }
+
+    private func rebuildSearchRecordsStorage() {
+        searchRecordsStorage = recordsStorage.enumerated().map { index, record in
+            SearchRecord(record: record, index: index)
+        }
     }
 
     private func setResultsIfChanged(_ newResults: [FileRecord]) {
@@ -976,6 +1070,7 @@ public final class SearchAppModel {
 
     private func noteRecordOpened(path: String, at date: Date = Date()) {
         updateOpenStats(path: path, at: date, in: &recordsStorage)
+        rebuildSearchRecordsStorage()
         recordsRevision &+= 1
         updateOpenStats(path: path, at: date, in: &results)
         refreshResults()
@@ -1420,8 +1515,7 @@ public final class SearchAppModel {
                 return
             }
 
-            recordsStorage = mergedRecords
-            recordsRevision &+= 1
+            replaceRecordsStorage(mergedRecords)
             indexedRecordCount = mergedRecords.count
             lastRescanDurationMS = elapsedMilliseconds(since: startedAt)
             refreshResults(showActivity: false)
@@ -1435,8 +1529,7 @@ public final class SearchAppModel {
     private func unloadMemoryIndex() {
         let hadLoadedResources = hasForegroundResources
         trimVisibleResultsForBackground()
-        recordsStorage = []
-        recordsRevision &+= 1
+        replaceRecordsStorage([])
         lastCompletedSearchContext = nil
         pendingSearchContext = nil
         lastSearchDurationMS = nil
@@ -1452,6 +1545,7 @@ public final class SearchAppModel {
         isMemoryIndexLoaded
             || isLoadingFullIndex
             || !recordsStorage.isEmpty
+            || !searchRecordsStorage.isEmpty
             || results.count > backgroundResultSnapshotLimit
     }
 
@@ -1795,8 +1889,7 @@ public final class SearchAppModel {
 
     private func handlePermissionStatusChanged(previous: PermissionStatus, current: PermissionStatus) {
         if !current.fullDiskAccessGranted {
-            recordsStorage = filterPermissionRestrictedRecords(from: recordsStorage)
-            recordsRevision &+= 1
+            replaceRecordsStorage(filterPermissionRestrictedRecords(from: recordsStorage))
             indexedRecordCount = recordsStorage.count
             refreshResults(showActivity: false)
             return
@@ -1812,8 +1905,7 @@ public final class SearchAppModel {
         do {
             let loadedRecords = try await store.loadAll()
             let scopedRecords = filterIndexSettingsRecords(from: loadedRecords)
-            recordsStorage = filterPermissionRestrictedRecords(from: scopedRecords)
-            recordsRevision &+= 1
+            replaceRecordsStorage(filterPermissionRestrictedRecords(from: scopedRecords))
             indexedRecordCount = recordsStorage.count
             refreshResults(showActivity: false)
         } catch {

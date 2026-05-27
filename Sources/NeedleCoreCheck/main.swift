@@ -93,13 +93,16 @@ struct NeedleCoreCheck {
         } + [
             makeRecord(path: "/tmp/needle-large-index/favorites/needle-target.swift", name: "needle-target.swift", ext: "swift")
         ]
+        let cachedRecords = records.enumerated().map { index, record in
+            SearchRecord(record: record, index: index)
+        }
 
         let startedAt = CFAbsoluteTimeGetCurrent()
-        let results = engine.search(records, query: .parse("needle-target .swift"), preferredFolderPaths: ["/tmp/needle-large-index/favorites"])
+        let results = engine.search(cachedRecords, records: records, query: .parse("needle-target .swift"), preferredFolderPaths: ["/tmp/needle-large-index/favorites"])
         let elapsedMS = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
 
         try expect(results.first?.name == "needle-target.swift", "large-index search should find the intended result")
-        try expect(elapsedMS < 2_000, "large-index search should complete under 2 seconds, actual \(elapsedMS) ms")
+        try expect(elapsedMS < 1_000, "cached large-index search should complete under 1 second, actual \(elapsedMS) ms")
     }
 
     private static func checkSQLite() async throws {

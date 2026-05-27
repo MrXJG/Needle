@@ -200,6 +200,24 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(results.map(\.path), ["/Users/me/Downloads/PlayCover_3.1.0.dmg"])
     }
 
+    func testCachedSearchRecordsMatchFileRecordSearchResults() {
+        let engine = SearchEngine()
+        let records = [
+            makeRecord(path: "/Users/me/Downloads/PlayCover_3.1.0.dmg", name: "PlayCover_3.1.0.dmg", ext: "dmg"),
+            makeRecord(path: "/Users/me/Work/微信.app", name: "WeChat.app", displayName: "微信.app", kind: .folder, ext: "app"),
+            makeRecord(path: "/Users/me/Work/report.txt", name: "report.txt", ext: "txt")
+        ]
+        let cachedRecords = records.enumerated().map { index, record in
+            SearchRecord(record: record, index: index)
+        }
+        let query = SearchQuery.parse("微信.app")
+
+        XCTAssertEqual(
+            engine.search(records, query: query).map(\.path),
+            engine.search(cachedRecords, records: records, query: query).map(\.path)
+        )
+    }
+
     @MainActor
     func testNewQueryClearsStaleVisibleResultsUntilMatchingResultsApply() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -644,6 +662,29 @@ final class SearchCoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    func testLargeIndexSearchWithCachedRecordsCompletesQuickly() {
+        let engine = SearchEngine()
+        let records = (0..<100_000).map { index in
+            makeRecord(
+                path: "/tmp/needle-large-index/project-\(index % 200)/file-\(index).swift",
+                name: "file-\(index).swift",
+                ext: "swift"
+            )
+        } + [
+            makeRecord(path: "/tmp/needle-large-index/favorites/needle-target.swift", name: "needle-target.swift", ext: "swift")
+        ]
+        let cachedRecords = records.enumerated().map { index, record in
+            SearchRecord(record: record, index: index)
+        }
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let results = engine.search(cachedRecords, records: records, query: .parse("needle-target .swift"), preferredFolderPaths: ["/tmp/needle-large-index/favorites"])
+        let elapsedMS = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+
+        XCTAssertEqual(results.first?.name, "needle-target.swift")
+        XCTAssertLessThan(elapsedMS, 1_000)
+    }
+
     @MainActor
     func testEquivalentSearchResultsDoNotReplaceVisibleList() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -685,8 +726,10 @@ final class SearchCoreTests: XCTestCase {
     func testStartPrunesSQLiteRecordsExcludedByCurrentSettings() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let appURL = directory.appendingPathComponent("WeChat.app", isDirectory: true)
         let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
         let store = SQLiteStore(databaseURL: databaseURL)
+        try FileManager.default.createDirectory(at: appURL, withIntermediateDirectories: true)
         try await store.open()
         try await store.upsert([
             makeRecord(path: "/Users/me/project/App.swift", name: "App.swift", ext: "swift"),
@@ -988,6 +1031,62 @@ final class SearchCoreTests: XCTestCase {
         XCTAssertEqual(records.first?.displayName, "说明.md")
         XCTAssertEqual(records.first?.openCount, 1)
         XCTAssertEqual(records.first?.lastOpenedAt, openedAt)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testSQLiteSearchCandidatesFindsLocalizedDisplayNames() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let url = directory.appendingPathComponent("index.sqlite")
+        let store = SQLiteStore(databaseURL: url)
+        try await store.open()
+
+        try await store.upsert([
+            makeRecord(path: "/Applications/WeChat.app", name: "WeChat.app", displayName: "微信.app", kind: .folder, ext: "app"),
+            makeRecord(path: "/Users/me/Library/Application Support/微信开发者工具/cache.js", name: "cache.js", ext: "js"),
+            makeRecord(path: "/Applications/TextEdit.app", name: "TextEdit.app", displayName: "文本编辑.app", kind: .folder, ext: "app")
+        ])
+
+        let candidates = try await store.searchCandidates(query: .parse("微信"), limit: 20)
+
+        XCTAssertEqual(candidates.first?.path, "/Applications/WeChat.app")
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testFirstSearchUsesSQLiteCandidatesBeforeFullIndexIsLoaded() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let appURL = directory.appendingPathComponent("WeChat.app", isDirectory: true)
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let store = SQLiteStore(databaseURL: databaseURL)
+        try FileManager.default.createDirectory(at: appURL, withIntermediateDirectories: true)
+        try await store.open()
+        try await store.upsert((0..<300).map { index in
+            makeRecord(path: directory.appendingPathComponent("filler-\(index).txt").path, name: "filler-\(index).txt")
+        } + [
+            makeRecord(path: appURL.path, name: "WeChat.app", displayName: "微信.app", kind: .folder, ext: "app")
+        ])
+
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.save(AppSettings(hasCompletedOnboarding: true))
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: preferences,
+            searchDebounceDelay: .milliseconds(0),
+            preloadFullIndexOnStart: false
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+
+        model.queryText = "微信"
+        try await waitForSearchResults(model)
+
+        XCTAssertEqual(model.results.map(\.displayLabel), ["微信.app"])
 
         try? FileManager.default.removeItem(at: directory)
     }
