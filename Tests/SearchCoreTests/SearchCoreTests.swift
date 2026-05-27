@@ -645,6 +645,43 @@ final class SearchCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testEquivalentSearchResultsDoNotReplaceVisibleList() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let fileURL = directory.appendingPathComponent("needle-stable-list.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: fileURL)
+
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: AppPreferences(defaults: defaults),
+            searchDebounceDelay: .milliseconds(0),
+            searchActivityDelay: .seconds(5)
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+        model.queryText = "needle-stable-list"
+
+        await model.start()
+        await model.rebuildIndex()
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+        let displayedRevision = model.displayedResultsRevision
+        let executedBefore = model.executedSearchCount
+
+        model.bumpRecordsRevisionForTesting()
+        model.refreshResultsForTesting(showActivity: false)
+        try await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertGreaterThan(model.executedSearchCount, executedBefore)
+        XCTAssertEqual(model.displayedResultsRevision, displayedRevision)
+        XCTAssertEqual(model.results.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }, [fileURL.standardizedFileURL.path])
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
     func testStartPrunesSQLiteRecordsExcludedByCurrentSettings() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let databaseURL = directory.appendingPathComponent("index.sqlite")

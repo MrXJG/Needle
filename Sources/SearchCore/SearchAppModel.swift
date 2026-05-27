@@ -42,6 +42,7 @@ public final class SearchAppModel {
     public private(set) var isLoadingFullIndex = false
     public private(set) var executedSearchCount = 0
     public private(set) var skippedSearchCount = 0
+    private(set) var displayedResultsRevision = 0
     public private(set) var updateCheckState: UpdateCheckState = .idle
     public private(set) var lastUpdateCheckedAt: Date?
     public private(set) var currentAppVersion: String
@@ -224,7 +225,7 @@ public final class SearchAppModel {
                 fullDiskAccessGranted: permissionStatus.fullDiskAccessGranted
             )
             recordsStorage = visiblePreviewRecords
-            results = Array(visiblePreviewRecords.prefix(startupPreviewLimit))
+            setResultsIfChanged(Array(visiblePreviewRecords.prefix(startupPreviewLimit)))
             indexedRecordCount = totalRecordCount
             isMemoryIndexLoaded = false
             isLoadingFullIndex = true
@@ -260,7 +261,7 @@ public final class SearchAppModel {
             recordsRevision &+= 1
             isMemoryIndexLoaded = true
             indexedRecordCount = 0
-            results = []
+            setResultsIfChanged([])
             isAwaitingSearchResults = false
             stopSearchActivity()
             state = .idle
@@ -485,6 +486,11 @@ public final class SearchAppModel {
 
     public func enterBackground() {
         cancelBackgroundReleaseTasks()
+        guard !Self.hasVisibleSearchWindow else {
+            isBackgroundRequested = false
+            backgroundMemoryStage = .foreground
+            return
+        }
         let delay = backgroundUnloadDelay
         backgroundUnloadTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
@@ -554,7 +560,7 @@ public final class SearchAppModel {
         guard isBackgroundRequested, !Self.hasVisibleSearchWindow else { return }
         backgroundDeepUnloadTask = nil
         backgroundMemoryStage = .deep
-        results = []
+        setResultsIfChanged([])
         lastDisplayedSearchContext = nil
         lastCompletedSearchContext = nil
         pendingSearchContext = nil
@@ -570,7 +576,7 @@ public final class SearchAppModel {
         guard isBackgroundRequested, !Self.hasVisibleSearchWindow else { return }
         backgroundColdUnloadTask = nil
         backgroundMemoryStage = .cold
-        results = []
+        setResultsIfChanged([])
         recordsStorage = []
         recordsRevision &+= 1
         lastDisplayedSearchContext = nil
@@ -636,7 +642,7 @@ public final class SearchAppModel {
             indexedSettings = settings
             startWatching()
             if queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                results = Array(recordsStorage.prefix(startupPreviewLimit))
+                setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
                 isAwaitingSearchResults = false
                 stopSearchActivity()
             } else {
@@ -657,6 +663,16 @@ public final class SearchAppModel {
     private func refreshResults(showActivity: Bool = false) {
         scheduleSearch(delay: .milliseconds(0), showActivity: showActivity)
     }
+
+#if DEBUG
+    func refreshResultsForTesting(showActivity: Bool = false) {
+        refreshResults(showActivity: showActivity)
+    }
+
+    func bumpRecordsRevisionForTesting() {
+        recordsRevision &+= 1
+    }
+#endif
 
     private func startVisibilityMonitorIfNeeded() {
         guard visibilityMonitorTask == nil else { return }
@@ -745,7 +761,7 @@ public final class SearchAppModel {
             let trimmedQuery = context.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
             let isNewVisibleQuery = !trimmedQuery.isEmpty && lastDisplayedSearchContext != currentDisplaySearchContext()
             if isNewVisibleQuery {
-                results = []
+                setResultsIfChanged([])
                 lastDisplayedSearchContext = nil
             }
             isAwaitingSearchResults = !trimmedQuery.isEmpty
@@ -802,11 +818,11 @@ public final class SearchAppModel {
             isAwaitingSearchResults = false
             pendingSearchContext = nil
             isSearching = false
-            results = Array(recordsStorage.prefix(startupPreviewLimit))
+            setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
             return
         }
 
-        results = []
+        setResultsIfChanged([])
         lastDisplayedSearchContext = nil
         isAwaitingSearchResults = true
         pendingSearchContext = context
@@ -888,18 +904,18 @@ public final class SearchAppModel {
         isAwaitingSearchResults = false
         guard !candidates.isEmpty else {
             if shouldRestoreDefaultResultsWhenCandidatesAreEmpty() {
-                results = Array(recordsStorage.prefix(200))
+                setResultsIfChanged(Array(recordsStorage.prefix(200)))
                 lastDisplayedSearchContext = currentDisplaySearchContext()
                 lastCompletedSearchContext = currentSearchContext()
                 return
             }
-            results = []
+            setResultsIfChanged([])
             lastDisplayedSearchContext = currentDisplaySearchContext()
             return
         }
 
         guard validateExistence else {
-            results = candidates
+            setResultsIfChanged(candidates)
             lastDisplayedSearchContext = currentDisplaySearchContext()
             return
         }
@@ -916,7 +932,7 @@ public final class SearchAppModel {
             }
         }
 
-        results = visible
+        setResultsIfChanged(visible)
         lastDisplayedSearchContext = currentDisplaySearchContext()
         guard !missingPaths.isEmpty else { return }
 
@@ -925,6 +941,25 @@ public final class SearchAppModel {
         indexedRecordCount = recordsStorage.count
         pendingRescanPaths.formUnion(missingPaths)
         schedulePendingRescanTask()
+    }
+
+    private func setResultsIfChanged(_ newResults: [FileRecord]) {
+        guard !Self.areEquivalentVisibleResults(results, newResults) else {
+            return
+        }
+        results = newResults
+        displayedResultsRevision += 1
+    }
+
+    nonisolated private static func areEquivalentVisibleResults(_ lhs: [FileRecord], _ rhs: [FileRecord]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { left, right in
+            left.id == right.id
+                && left.displayLabel == right.displayLabel
+                && left.kind == right.kind
+                && left.size == right.size
+                && left.modifiedAt == right.modifiedAt
+        }
     }
 
     private func shouldValidateResultExistence(for context: SearchContext) -> Bool {
@@ -1430,7 +1465,7 @@ public final class SearchAppModel {
 
     private func trimVisibleResultsForBackground() {
         guard results.count > backgroundResultSnapshotLimit else { return }
-        results = Array(results.prefix(backgroundResultSnapshotLimit))
+        setResultsIfChanged(Array(results.prefix(backgroundResultSnapshotLimit)))
     }
 
     nonisolated private static func recordsByApplyingRescan(
