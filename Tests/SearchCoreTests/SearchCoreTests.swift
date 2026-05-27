@@ -1085,8 +1085,49 @@ final class SearchCoreTests: XCTestCase {
 
         model.queryText = "微信"
         try await waitForSearchResults(model)
+        try await Task.sleep(for: .milliseconds(120))
 
         XCTAssertEqual(model.results.map(\.displayLabel), ["微信.app"])
+        XCTAssertFalse(model.isMemoryIndexLoaded)
+        XCTAssertFalse(model.isLoadingFullIndex)
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    @MainActor
+    func testRedundantForegroundEntryDoesNotRefreshVisibleSearchResults() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let databaseURL = directory.appendingPathComponent("index.sqlite")
+        let appURL = directory.appendingPathComponent("WeChat.app", isDirectory: true)
+        let defaults = UserDefaults(suiteName: "NeedleTests.\(UUID().uuidString)")!
+        let store = SQLiteStore(databaseURL: databaseURL)
+        try FileManager.default.createDirectory(at: appURL, withIntermediateDirectories: true)
+        try await store.open()
+        try await store.upsert([
+            makeRecord(path: appURL.path, name: "WeChat.app", displayName: "微信.app", kind: .folder, ext: "app")
+        ])
+
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.save(AppSettings(hasCompletedOnboarding: true))
+        let model = SearchAppModel(
+            databaseURL: databaseURL,
+            preferences: preferences,
+            searchDebounceDelay: .milliseconds(0),
+            preloadFullIndexOnStart: false
+        )
+        model.settings = IndexSettings(roots: [directory.path], excludedNamePatterns: [], includeHiddenFiles: false)
+
+        await model.start()
+        model.queryText = "微信"
+        try await waitForSearchResults(model)
+        let displayedRevision = model.displayedResultsRevision
+
+        await model.enterForeground()
+        try await Task.sleep(for: .milliseconds(120))
+
+        XCTAssertEqual(model.displayedResultsRevision, displayedRevision)
+        XCTAssertEqual(model.results.map(\.displayLabel), ["微信.app"])
+        XCTAssertFalse(model.isAwaitingSearchResults)
 
         try? FileManager.default.removeItem(at: directory)
     }

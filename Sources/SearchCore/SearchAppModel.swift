@@ -591,7 +591,7 @@ public final class SearchAppModel {
         backgroundColdUnloadTask = nil
         backgroundMemoryStage = .cold
         setResultsIfChanged([])
-        replaceRecordsStorage([])
+        clearRecordsStorage()
         lastDisplayedSearchContext = nil
         lastCompletedSearchContext = nil
         pendingSearchContext = nil
@@ -615,6 +615,7 @@ public final class SearchAppModel {
     }
 
     public func enterForeground() async {
+        guard isBackgroundRequested || backgroundMemoryStage != .foreground else { return }
         cancelBackgroundReleaseTasks()
         backgroundMemoryStage = .foreground
         if let update = backgroundEventBuffer.drainAndEnterForeground() {
@@ -650,11 +651,11 @@ public final class SearchAppModel {
             ))
             indexedRecordCount = totalRecordCount
             isMemoryIndexLoaded = false
-            isLoadingFullIndex = true
+            isLoadingFullIndex = false
             indexedSettings = settings
             startWatching()
             if queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
+                setResultsIfChanged(Array(recordsStorage.prefix(startupPreviewLimit)))
                 isAwaitingSearchResults = false
                 stopSearchActivity()
             } else {
@@ -894,17 +895,7 @@ public final class SearchAppModel {
                     self.finishSearchActivityAfterPresentation(generation: generation, context: context)
                 }
                 self.lastSearchDurationMS = candidateOutcome.duration
-                self.startFullIndexLoadForSearchIfNeeded()
             }
-        }
-    }
-
-    private func startFullIndexLoadForSearchIfNeeded() {
-        if fullIndexLoadTask == nil {
-            loadFullIndexInBackground(pruneExcludedRecords: false, delay: .zero)
-        } else if !isLoadingFullIndex {
-            fullIndexLoadTask?.cancel()
-            loadFullIndexInBackground(pruneExcludedRecords: false, delay: .zero)
         }
     }
 
@@ -1026,6 +1017,14 @@ public final class SearchAppModel {
     private func replaceRecordsStorage(_ records: [FileRecord], bumpRevision: Bool = true) {
         recordsStorage = records
         rebuildSearchRecordsStorage()
+        if bumpRevision {
+            recordsRevision &+= 1
+        }
+    }
+
+    private func clearRecordsStorage(bumpRevision: Bool = true) {
+        recordsStorage.removeAll(keepingCapacity: false)
+        searchRecordsStorage.removeAll(keepingCapacity: false)
         if bumpRevision {
             recordsRevision &+= 1
         }
@@ -1529,7 +1528,7 @@ public final class SearchAppModel {
     private func unloadMemoryIndex() {
         let hadLoadedResources = hasForegroundResources
         trimVisibleResultsForBackground()
-        replaceRecordsStorage([])
+        clearRecordsStorage()
         lastCompletedSearchContext = nil
         pendingSearchContext = nil
         lastSearchDurationMS = nil

@@ -777,6 +777,13 @@ private struct PacmanShape: Shape {
 }
 
 struct ResultsList: View, @preconcurrency Equatable {
+    private enum SortColumn {
+        case name
+        case kind
+        case size
+        case modifiedAt
+    }
+
     let results: [FileRecord]
     @Binding var selection: FileRecord.ID?
     let open: (FileRecord) -> Void
@@ -787,7 +794,8 @@ struct ResultsList: View, @preconcurrency Equatable {
     let copyPath: (FileRecord) -> Void
     let copyName: (FileRecord) -> Void
     let copyParentPath: (FileRecord) -> Void
-    @State private var sortOrder = [KeyPathComparator<FileRecord>]()
+    @State private var sortColumn: SortColumn?
+    @State private var sortAscending = true
 
     static func == (lhs: ResultsList, rhs: ResultsList) -> Bool {
         lhs.selection == rhs.selection
@@ -797,7 +805,7 @@ struct ResultsList: View, @preconcurrency Equatable {
     }
 
     private var displayedResults: [FileRecord] {
-        guard let primaryComparator = sortOrder.first else {
+        guard let sortColumn else {
             return results
         }
 
@@ -808,12 +816,14 @@ struct ResultsList: View, @preconcurrency Equatable {
                 return lhsGroup < rhsGroup
             }
 
-            let primaryComparison = primaryComparator.compare(lhs, rhs)
+            let primaryComparison = compare(lhs, rhs, by: sortColumn)
             if primaryComparison != .orderedSame {
-                return primaryComparison == .orderedAscending
+                return sortAscending
+                    ? primaryComparison == .orderedAscending
+                    : primaryComparison == .orderedDescending
             }
 
-            let nameComparison = lhs.name.localizedStandardCompare(rhs.name)
+            let nameComparison = lhs.displayLabel.localizedStandardCompare(rhs.displayLabel)
             if nameComparison != .orderedSame {
                 return nameComparison == .orderedAscending
             }
@@ -823,64 +833,155 @@ struct ResultsList: View, @preconcurrency Equatable {
     }
 
     var body: some View {
-        Table(displayedResults, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("名称", value: \.needleSortName) { record in
-                HStack(spacing: 8) {
-                    FileIconView(record: record, mode: .list, size: 18)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(record.displayLabel)
-                            .fontWeight(.medium)
-                        Text(record.parentPath)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(displayedResults) { record in
+                        resultRow(record)
                     }
                 }
-                .padding(.vertical, 3)
+                .padding(.vertical, 6)
             }
-            TableColumn("类型", value: \.needleSortKind) { record in
-                Text(displayKind(record))
-                    .foregroundStyle(.secondary)
-            }
-            .width(70)
-            TableColumn("大小", value: \.needleSortSize) { record in
-                Text(record.kind == .folder ? "-" : ByteCountFormatter.string(fromByteCount: record.size, countStyle: .file))
-                    .foregroundStyle(.secondary)
-            }
-            .width(90)
-            TableColumn("修改时间", value: \.needleSortModifiedAt) { record in
-                Text(record.modifiedAt, style: .date)
-                    .foregroundStyle(.secondary)
-            }
-            .width(110)
         }
-        .contextMenu(forSelectionType: FileRecord.ID.self) { selectedIDs in
-            if let record = displayedResults.first(where: { selectedIDs.contains($0.id) }) {
-                Button("打开") { open(record) }
-                Button("打开方式...") { openWithApplicationPicker(record) }
-                Button("快速预览") { quickLook(record) }
-                Divider()
-                Button("在 Finder 中显示") { reveal(record) }
-                Button("打开父文件夹") { openParentFolder(record) }
-                Divider()
-                Button("复制路径") { copyPath(record) }
-                Button("复制文件名") { copyName(record) }
-                Button("复制父文件夹路径") { copyParentPath(record) }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 0) {
+            sortButton("名称", column: .name)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            sortButton("类型", column: .kind)
+                .frame(width: 82, alignment: .leading)
+            sortButton("大小", column: .size)
+                .frame(width: 96, alignment: .trailing)
+            sortButton("修改时间", column: .modifiedAt)
+                .frame(width: 118, alignment: .trailing)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.thinMaterial.opacity(0.35))
+    }
+
+    private func sortButton(_ title: String, column: SortColumn) -> some View {
+        Button {
+            if sortColumn == column {
+                sortAscending.toggle()
+            } else {
+                sortColumn = column
+                sortAscending = true
             }
-        } primaryAction: { selectedIDs in
-            if let record = displayedResults.first(where: { selectedIDs.contains($0.id) }) {
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                if sortColumn == column {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: column == .name || column == .kind ? .leading : .trailing)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func resultRow(_ record: FileRecord) -> some View {
+        let isSelected = selection == record.id
+
+        return HStack(spacing: 0) {
+            HStack(spacing: 8) {
+                FileIconView(record: record, mode: .list, size: 18)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(record.displayLabel)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Text(record.parentPath)
+                        .font(.caption)
+                        .foregroundStyle(isSelected ? Color.primary.opacity(0.78) : Color.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(displayKind(record))
+                .foregroundStyle(isSelected ? Color.primary.opacity(0.82) : Color.secondary)
+                .lineLimit(1)
+                .frame(width: 82, alignment: .leading)
+
+            Text(displaySize(record))
+                .foregroundStyle(isSelected ? Color.primary.opacity(0.82) : Color.secondary)
+                .lineLimit(1)
+                .frame(width: 96, alignment: .trailing)
+
+            Text(record.modifiedAt, style: .date)
+                .foregroundStyle(isSelected ? Color.primary.opacity(0.82) : Color.secondary)
+                .lineLimit(1)
+                .frame(width: 118, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.24) : Color.clear)
+        }
+        .padding(.horizontal, 8)
+        .onTapGesture {
+            selection = record.id
+        }
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded {
+                selection = record.id
                 open(record)
             }
+        )
+        .contextMenu {
+            Button("打开") { open(record) }
+            Button("打开方式...") { openWithApplicationPicker(record) }
+            Button("快速预览") { quickLook(record) }
+            Divider()
+            Button("在 Finder 中显示") { reveal(record) }
+            Button("打开父文件夹") { openParentFolder(record) }
+            Divider()
+            Button("复制路径") { copyPath(record) }
+            Button("复制文件名") { copyName(record) }
+            Button("复制父文件夹路径") { copyParentPath(record) }
         }
         .onDrag {
-            guard
-                let selection,
-                let record = displayedResults.first(where: { $0.id == selection })
-            else {
-                return NSItemProvider()
-            }
-            return NSItemProvider(contentsOf: URL(fileURLWithPath: record.path)) ?? NSItemProvider()
+            NSItemProvider(contentsOf: URL(fileURLWithPath: record.path)) ?? NSItemProvider()
         }
+    }
+
+    private func compare(_ lhs: FileRecord, _ rhs: FileRecord, by column: SortColumn) -> ComparisonResult {
+        switch column {
+        case .name:
+            return lhs.displayLabel.localizedStandardCompare(rhs.displayLabel)
+        case .kind:
+            let kindComparison = compare(lhs.needleSortKind, rhs.needleSortKind)
+            if kindComparison != .orderedSame {
+                return kindComparison
+            }
+            return lhs.displayLabel.localizedStandardCompare(rhs.displayLabel)
+        case .size:
+            return compare(lhs.needleSortSize, rhs.needleSortSize)
+        case .modifiedAt:
+            return lhs.needleSortModifiedAt.compare(rhs.needleSortModifiedAt)
+        }
+    }
+
+    private func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult {
+        if lhs < rhs { return .orderedAscending }
+        if lhs > rhs { return .orderedDescending }
+        return .orderedSame
+    }
+
+    private func displaySize(_ record: FileRecord) -> String {
+        record.kind == .folder ? "-" : ByteCountFormatter.string(fromByteCount: record.size, countStyle: .file)
     }
 
     private func folderFirstGroup(for record: FileRecord) -> Int {

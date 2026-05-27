@@ -82,10 +82,15 @@ public actor SQLiteStore {
             try execute("DELETE FROM files;")
             try upsert(recordsWithPreservedOpenStats)
             try execute("COMMIT;")
+            try? checkpointAndTruncateWAL()
         } catch {
             try? execute("ROLLBACK;")
             throw error
         }
+    }
+
+    public func checkpointAndTruncateWAL() throws {
+        try execute("PRAGMA wal_checkpoint(TRUNCATE);")
     }
 
     public func upsert(_ records: [FileRecord]) throws {
